@@ -39,7 +39,32 @@ fn with_descendants(roots: Vec<u32>) -> Vec<u32> {
     all
 }
 
-/// Direct children of a process: from /proc on Linux, from `pgrep -P` where there is no /proc (macOS).
+/// libproc, part of the system library on macOS: process facts without starting a `pgrep` or `ps` per question.
+#[cfg(target_os = "macos")]
+mod libproc {
+    use std::ffi::c_void;
+
+    extern "C" {
+        fn proc_listchildpids(ppid: i32, buffer: *mut c_void, buffersize: i32) -> i32;
+    }
+
+    pub fn children(pid: u32) -> Vec<u32> {
+        let mut buffer = vec![0i32; 1024];
+        // SAFETY: the buffer holds `buffersize` bytes; the call returns how many pids it wrote.
+        let count = unsafe { proc_listchildpids(pid as i32, buffer.as_mut_ptr().cast(), (buffer.len() * std::mem::size_of::<i32>()) as i32) };
+        buffer.truncate(count.max(0) as usize);
+        buffer.into_iter().filter(|&child| child > 0).map(|child| child as u32).collect()
+    }
+}
+
+/// Direct children of a process, from libproc.
+#[cfg(target_os = "macos")]
+fn children_of(pid: u32) -> Vec<u32> {
+    libproc::children(pid)
+}
+
+/// Direct children of a process: from /proc on Linux, from `pgrep -P` where there is no /proc.
+#[cfg(not(target_os = "macos"))]
 fn children_of(pid: u32) -> Vec<u32> {
     let listed = match fs::read_dir(format!("/proc/{pid}/task")) {
         Ok(tasks) => tasks.filter_map(Result::ok).map(|task| fs::read_to_string(task.path().join("children")).unwrap_or_default()).collect::<Vec<_>>().join(" "),
