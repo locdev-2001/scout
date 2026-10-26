@@ -174,10 +174,36 @@ pub fn status() -> Result<u8, String> {
     let home = home()?;
     println!("scout: {}", launcher()?.display());
     let contains = |path: PathBuf, needle: &str| fs::read_to_string(path).is_ok_and(|text| text.contains(needle));
-    // The user-scope server `setup` adds, not any mention of scout (skill usage, project paths) elsewhere in the file.
-    let claude_mcp = fs::read_to_string(home.join(".claude.json")).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()).is_some_and(|config| config.pointer("/mcpServers/scout").is_some());
-    println!("  Claude Code MCP:   {}", if claude_mcp { "registered" } else { "not registered" });
-    println!("  Claude Code hooks: {}", if contains(home.join(".claude/settings.json"), " hook after-edit") { "installed" } else { "not installed" });
+    let json = |path: PathBuf| fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    // Claude Code also reads servers and hooks set for the repository the command runs in, not only those `setup` adds
+    // for the user: each scope that has them is named.
+    let repo = std::env::current_dir().ok().and_then(|directory| directory.ancestors().find(|directory| directory.join(".git").exists()).map(Path::to_path_buf));
+    let claude = json(home.join(".claude.json"));
+    // A server named scout, not any mention of scout (skill usage, project paths) elsewhere in the file.
+    let mut mcp_scopes = Vec::new();
+    if claude.as_ref().is_some_and(|config| config.pointer("/mcpServers/scout").is_some()) {
+        mcp_scopes.push("user");
+    }
+    if let Some(repo) = &repo {
+        if claude.as_ref().and_then(|config| config.get("projects")?.get(repo.to_string_lossy().as_ref())?.pointer("/mcpServers/scout")).is_some() {
+            mcp_scopes.push("local");
+        }
+        if json(repo.join(".mcp.json")).is_some_and(|config| config.pointer("/mcpServers/scout").is_some()) {
+            mcp_scopes.push("project .mcp.json");
+        }
+    }
+    let mut hook_scopes = Vec::new();
+    if contains(home.join(".claude/settings.json"), " hook after-edit") {
+        hook_scopes.push("user");
+    }
+    for settings in [".claude/settings.json", ".claude/settings.local.json"] {
+        if repo.as_ref().is_some_and(|repo| contains(repo.join(settings), " hook after-edit")) {
+            hook_scopes.push(settings);
+        }
+    }
+    let scopes = |found: Vec<&str>, yes: &str, no: &str| if found.is_empty() { no.to_owned() } else { format!("{yes} ({})", found.join(", ")) };
+    println!("  Claude Code MCP:   {}", scopes(mcp_scopes, "registered", "not registered"));
+    println!("  Claude Code hooks: {}", scopes(hook_scopes, "installed", "not installed"));
     println!("  Codex MCP:         {}", if contains(home.join(".codex/config.toml"), "mcp_servers.scout") { "registered" } else { "not registered" });
     let cache = daemon::cache_directory();
     println!("Saved analysis:    {} MB in {}", folder_bytes(&cache) / 1_048_576, cache.display());
