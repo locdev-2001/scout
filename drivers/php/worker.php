@@ -71,15 +71,15 @@ final class ForkedWorker
     }
 
     /**
-     * Starts $work in a child at the lowest CPU priority and returns at once; feed the stream to
+     * Starts $work in a child, at the lowest CPU priority unless said otherwise, and returns at once; feed the stream to
      * readAvailable() when it is readable until it returns the result.
      *
      * @return array{0: int, 1: resource, 2: string}
      */
-    public static function startBackground(callable $work, string $label = 'background'): array
+    public static function startBackground(callable $work, string $label = 'background', bool $lowPriority = true): array
     {
-        [$pid, $stream] = self::start(function () use ($work) {
-            if (! self::inline() && function_exists('proc_nice')) {
+        [$pid, $stream] = self::start(function () use ($work, $lowPriority) {
+            if ($lowPriority && ! self::inline() && function_exists('proc_nice')) {
                 proc_nice(19);
             }
 
@@ -135,7 +135,7 @@ final class ForkedWorker
         [$parentEnd, $childEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $pid = pcntl_fork();
         if ($pid === -1) {
-            throw new RuntimeException('cannot fork');
+            throw new RuntimeException('cannot fork: '.pcntl_strerror(pcntl_get_last_error()));
         }
         if ($pid === 0) {
             fclose($parentEnd);
@@ -310,11 +310,14 @@ final class WorkerPool
     /** @return array{0: int, 1: resource} */
     private function spawn(): array
     {
+        // A long question forks many one-shot workers: without this, the ones already gone pile up as zombies
+        // until it ends and can reach the per-user process limit.
+        ForkedWorker::reapFinished();
         [$parentEnd, $childEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $parent = getmypid();
         $pid = pcntl_fork();
         if ($pid === -1) {
-            throw new RuntimeException('cannot fork');
+            throw new RuntimeException('cannot fork: '.pcntl_strerror(pcntl_get_last_error()));
         }
         if ($pid === 0) {
             // Drop inherited streams (other workers' sockets, the warm-up's), so no process outlives its peer.
@@ -429,7 +432,8 @@ final class EngineGuard
 
 function workerParallelism(): int
 {
-    $cores = (int) (shell_exec('nproc 2>/dev/null') ?: 2);
+    // macOS has no `nproc`; `getconf` answers there and on Linux.
+    $cores = (int) (shell_exec('nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null') ?: 2);
 
     return max(1, intdiv($cores, 2));
 }

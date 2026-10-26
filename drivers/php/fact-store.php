@@ -26,6 +26,23 @@ final class FactStore implements BackgroundWork
 
     private const WARM_UP_CLASSES_PER_JOB = 100;
 
+    /**
+     * Files questions may read themselves before the warm-up is done. Past it they would read much of the repo
+     * twice, beside the warm-up and slower than it: the warm-up is finished first, at full speed.
+     */
+    private const READ_BEFORE_WARM_UP_LIMIT = 200;
+
+    /** How long a question waits for the warm-up to finish; past it, it reads what it needs itself. */
+    private const WARM_UP_WAIT_SECONDS = 120;
+
+    private int $readBeforeWarmUp = 0;
+
+    /** True while a question waits for the warm-up: more children, at normal priority. */
+    private bool $warmUpUrgent = false;
+
+    /** A wait for the warm-up ran out of time: later questions read what they need instead of waiting again. */
+    private bool $warmUpWaitGaveUp = false;
+
     /** More files than this changed since the facts were saved (another branch): reading everything is as quick. */
     private const SAVED_CHANGES_LIMIT = 500;
 
@@ -601,6 +618,10 @@ final class FactStore implements BackgroundWork
         if ($missing === []) {
             return;
         }
+        if ($this->warmUpQueue !== []) {
+            // Read here, so the warm-up need not read them again.
+            $this->warmUpQueue = array_values(array_diff($this->warmUpQueue, $missing));
+        }
         $missing = array_map(fn (string $path) => [$path, $previous[$path] ?? null, $changedPaths], $missing);
         $chunkSize = min(self::FILES_PER_WORKER, (int) ceil(count($missing) / $this->parallelism));
         try {
@@ -891,10 +912,36 @@ final class FactStore implements BackgroundWork
         $this->fillWarmUp();
     }
 
+    /** Reads the rest of the repo's files now, with every core; false if that took too long (it goes on behind). */
+    private function finishWarmUp(): bool
+    {
+        $started = microtime(true);
+        $this->warmUpUrgent = true;
+        $this->fillWarmUp();
+        while (! $this->allExtracted && microtime(true) - $started < self::WARM_UP_WAIT_SECONDS) {
+            $read = $this->streams();
+            if ($read === []) {
+                break;
+            }
+            $write = $except = null;
+            if (@stream_select($read, $write, $except, 1) > 0) {
+                foreach ($read as $stream) {
+                    $this->onReadable($stream);
+                }
+            }
+        }
+        $this->warmUpUrgent = false;
+        $this->warmUpWaitGaveUp = ! $this->allExtracted;
+        profilePhase('warm-up: finished for a question', $started, ['done' => $this->allExtracted]);
+
+        return $this->allExtracted;
+    }
+
     private function fillWarmUp(): void
     {
         $root = $this->files->repoRoot;
-        while (count($this->warmUpJobs) < self::WARM_UP_WORKERS && ($this->warmUpQueue !== [] || $this->warmUpSingles !== [])) {
+        $workers = $this->warmUpUrgent ? max(self::WARM_UP_WORKERS, 2 * $this->parallelism) : self::WARM_UP_WORKERS;
+        while (count($this->warmUpJobs) < $workers && ($this->warmUpQueue !== [] || $this->warmUpSingles !== [])) {
             $chunk = $this->warmUpSingles !== [] ? [array_shift($this->warmUpSingles)] : array_splice($this->warmUpQueue, 0, self::WARM_UP_FILES_PER_JOB);
             $job = ForkedWorker::startBackground(function () use ($root, $chunk) {
                 // The warm-up compiles most of the repo once; keep OPcache's shared memory for query workers.
@@ -906,7 +953,7 @@ final class FactStore implements BackgroundWork
                 }
 
                 return $facts;
-            }, 'warm-up files');
+            }, 'warm-up files', ! $this->warmUpUrgent);
             $this->warmUpJobs[(int) $job[1]] = $job;
             $this->warmUpChunks[(int) $job[1]] = ['files', $chunk, $this->changeSerial];
         }
@@ -1061,7 +1108,12 @@ final class FactStore implements BackgroundWork
             return;
         }
         $arguments = $regex ? ['--ignore-case', '-e', $pattern] : ['--ignore-case', '--word-regexp', '--fixed-strings', '-e', $pattern];
-        $this->extractFiles($this->files->ripgrep($arguments));
+        $paths = $this->files->ripgrep($arguments);
+        $this->readBeforeWarmUp += count(array_diff_key(array_flip($paths), $this->fileFacts));
+        if ($this->readBeforeWarmUp > self::READ_BEFORE_WARM_UP_LIMIT && ! $this->warmUpWaitGaveUp && $this->finishWarmUp()) {
+            return;
+        }
+        $this->extractFiles($paths);
         $this->scanned[$key] = true;
     }
 
