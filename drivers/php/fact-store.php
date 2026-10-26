@@ -21,8 +21,11 @@ final class FactStore implements BackgroundWork
     /** Warm-up runs beside queries at the lowest CPU priority, with fewer children than a query uses. */
     private const WARM_UP_WORKERS = 3;
 
-    /** Small batches keep each warm-up child's memory low (a child keeps every file it parsed). */
-    private const WARM_UP_FILES_PER_JOB = 10;
+    /**
+     * A child keeps every file it parsed, so batches stay small (about 50 MB each); but each child also costs a fork
+     * and loads classes anew, which at 10 files took a third of the warm-up's CPU.
+     */
+    private const WARM_UP_FILES_PER_JOB = 50;
 
     private const WARM_UP_CLASSES_PER_JOB = 100;
 
