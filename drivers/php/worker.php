@@ -429,8 +429,7 @@ final class EngineGuard
 
 function workerParallelism(): int
 {
-    // macOS has no `nproc`; `getconf` answers there and on Linux.
-    $cores = (int) (shell_exec('nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null') ?: 2);
+    $cores = (int) (shell_exec('nproc 2>/dev/null') ?: 2);
 
     return max(1, intdiv($cores, 2));
 }
