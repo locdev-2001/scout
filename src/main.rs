@@ -38,7 +38,7 @@ const USAGE: &str = "Usage:
   scout logs [repo]                        the end of the servers' logs
   scout update                             pull the tool's repository, rebuild, set up again
   scout --version
-  scout hook after-edit|before-search      Claude Code hook (reads the hook's JSON on stdin)
+  scout hook after-edit|before-search|session-start  Claude Code hook (reads the hook's JSON on stdin)
   scout claude-hooks install|remove        add or remove those hooks in ~/.claude/settings.json
     --dry-run       print the settings it would write
   --repo DIR        repository to inspect (default: the one containing the current directory)";

@@ -97,6 +97,17 @@ fn connect(repo_root: &Path, start: bool) -> Result<Stream, String> {
     Err(format!("server did not start: {}", log.trim()))
 }
 
+/// Starts the repository's server when none runs, without waiting for it: it reads the code while the agent works,
+/// so the next question finds it ready. A second start for the same repository is turned away by the server's lock.
+pub fn ensure_running(repo_root: &Path) -> Result<(), String> {
+    let socket = socket_path(repo_root);
+    if ipc::connect(&socket).is_ok() {
+        return Ok(());
+    }
+    fs::create_dir_all(socket.parent().unwrap()).map_err(|error| error.to_string())?;
+    start_server(repo_root, &socket)
+}
+
 pub fn query(repo_root: &Path, request: &QueryRequest) -> Result<QueryResponse, String> {
     ask(repo_root, request, true)
 }

@@ -364,3 +364,27 @@ Còn lại trên 100 ms: S4 (boot lại Laravel ~72 ms + tính lại), S5 (làm 
 
 10 method thật, chọn có chủ đích: gọi qua interface, Eloquent static, job dispatch từ controller, listener chỉ tới được qua event, observer, tên phổ biến (`handle`/`create`), gọi qua `$this->prop`, gọi qua biến cục bộ.
 Mỗi method ghi: số file `rg` khớp, số kết quả theo confidence, số caller thật đối chiếu tay, chỗ sót và chỗ báo sai.
+
+
+## Hook dùng được thật (26/10/2026)
+
+Đo trên lịch sử 10 phiên Claude Code hôm 26/10: agent **không tự gọi scout lần nào** (0 lời gọi MCP, 0 lệnh `scout`), tìm bằng `rg`/`grep` khoảng 1.400 lần. Hook tìm kiếm chỉ trả lời khi server của repo đã chạy sẵn, nên gần như im lặng (6 lần trả lời).
+
+Sửa:
+- hook `session-start` (SessionStart): bật server cho repo của thư mục phiên, trả về sau ~18 ms; câu đầu sau đó 313 ms (debtnote).
+- hook `before-search` tự bật server cho repo đang được tìm (lần tìm đó chưa có kết quả, các lần sau có).
+- đọc mọi lần tìm trong lệnh, kể cả trong `$( … )`; bỏ grep đọc output của lệnh khác (`… | grep x`), `-v`, và tìm trong file không phải code (`.env`, `.md`, `.json`, …); bỏ `public/private/static…` trước `function`; hỏi tối đa 2 tên mỗi lệnh; một hạn 1,5 s chung cho cả lệnh.
+
+Đo bằng cách phát lại 693 lệnh tìm thật còn chạy được (757 lệnh khác nằm trong worktree đã gỡ), lượt lạnh (chưa server nào) rồi lượt ấm:
+
+| | Trả lời | Trung vị | p95 | > 1 s |
+| --- | --- | --- | --- | --- |
+| Hook cũ, ấm | 33/693 | 13 ms | 135 ms | 0 |
+| Hook mới, lạnh | 30/693 | 17 ms | 1.515 ms | 50 |
+| Hook mới, ấm | 42/693 | 15 ms | 241 ms | 13 |
+
+Khoảng 136–200 lệnh có tìm một cái tên; phần không được trả lời chủ yếu là tên không phải hàm (khoá dịch, khoá cấu hình, `password`, `deploy`). Câu trả lời đúng ý ở phần lớn trường hợp (agent tìm định nghĩa hàm X, hook đưa người gọi X). Giới hạn: server trả lời từng câu một, một câu chậm (lúc server còn đọc code, câu đầu cho một tên mất tới 12 s) làm các lần tìm sau chờ tới trần 1,5 s.
+
+RAM: phát lại bật 6 server (3 bản backend: repo chính + 2 worktree), RAM trống giảm khoảng 4,3–5 GB lúc cao nhất; tự tắt sau 10 phút rảnh.
+
+Còn mở (RAM): driver Laravel để sót tiến trình con ~330 MB còn đọc stdin của driver (có thể là nguyên nhân driver Laravel thỉnh thoảng kẹt); driver PHP giữ model token của nhiều file (~630 MB trên backend).

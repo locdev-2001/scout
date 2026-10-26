@@ -89,7 +89,7 @@ Lệnh này build công cụ rồi chạy `scout setup`, làm trọn mọi bư�
 
 - tạo lệnh `scout` trong `~/.local/bin`;
 - gắn MCP server cho Claude Code và Codex (agent khác: thêm MCP server chạy `scout mcp`);
-- gắn hai hook cho Claude Code: sửa một hàm xong, agent thấy ngay những chỗ gọi hàm đó; agent grep một tên hàm, nó nhận thêm danh sách người gọi chính xác (lệnh grep vẫn chạy như thường);
+- gắn ba hook cho Claude Code: phiên vừa mở thì tiến trình nền của repo bắt đầu đọc code; sửa một hàm xong, agent thấy ngay những chỗ gọi hàm đó; agent grep một tên hàm (kể cả trong `$( … )` hay nhiều lần tìm nối nhau), nó nhận thêm danh sách người gọi chính xác. Lệnh grep vẫn chạy như thường, hook chỉ thêm 15 ms ở trung vị và không bao giờ quá 1,5 giây; grep lọc output của lệnh khác hay tìm trong `.env`, `.md`, `.json` thì bị bỏ qua. Lần grep đầu tiên trong một repo chưa có tiến trình nền sẽ bật nó lên, nên có thể chưa kèm kết quả;
 - thêm vài dòng hướng dẫn vào `~/.claude/CLAUDE.md` và `~/.codex/AGENTS.md`;
 - cài bộ đọc JavaScript dự phòng cho dự án không có `typescript` riêng;
 - báo máy có những gì để phân tích code (PHP, Node, Python, rust-analyzer).

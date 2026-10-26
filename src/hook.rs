@@ -3,6 +3,8 @@
 //!
 //! `after-edit` (PostToolUse on Edit/MultiEdit): the direct callers of each function just edited.
 //! `before-search` (PreToolUse on Grep/Bash): a text search for a function name also gets that function's callers.
+//! `session-start` (SessionStart): the server of the session's repository starts reading the code, so the first
+//! searches find it ready.
 //!
 //! Hooks never block or slow the agent: the search still runs, a server not ready in time adds nothing, and any
 //! failure is silent.
@@ -24,6 +26,9 @@ const SEARCH_BUDGET: Duration = Duration::from_millis(1500);
 const KEYWORDS: [&str; 16] = ["function", "class", "def", "return", "public", "private", "protected", "static", "const", "import", "export", "async", "await", "interface", "trait", "struct"];
 /// Lines of answer one hook adds at most: enough for the direct callers, small enough for the context.
 const MAX_LINES: usize = 40;
+/// Names asked about at most per search command: the server answers one question at a time, so each extra one can
+/// keep the next search waiting.
+const MAX_SEARCHED_NAMES: usize = 2;
 /// Edited places looked up at most per edit.
 const MAX_PLACES: usize = 3;
 
@@ -36,6 +41,7 @@ pub fn run(event: &str) -> u8 {
     let context = match event {
         "after-edit" => after_edit(&input),
         "before-search" => before_search(&input),
+        "session-start" => session_start(&input),
         _ => None,
     };
     if let Some(context) = context {
@@ -78,36 +84,87 @@ fn declared_below(content: &str, line: usize) -> usize {
     content.lines().enumerate().skip(line - 1).find(|(_, text)| !leading(text)).map_or(line, |(index, _)| index + 1)
 }
 
+fn session_start(input: &Value) -> Option<String> {
+    let cwd = PathBuf::from(input.get("cwd")?.as_str()?);
+    let _ = daemon::ensure_running(&repo_root(&cwd)?);
+    None
+}
+
 fn before_search(input: &Value) -> Option<String> {
     let tool_input = input.get("tool_input")?;
     let cwd = PathBuf::from(input.get("cwd").and_then(Value::as_str).unwrap_or("."));
-    let (pattern, place) = match input.get("tool_name")?.as_str()? {
-        "Grep" => (tool_input.get("pattern")?.as_str()?.to_owned(), tool_input.get("path").and_then(Value::as_str).map(|path| cwd.join(path)).unwrap_or(cwd)),
-        "Bash" => searched(tool_input.get("command")?.as_str()?, &cwd)?,
+    let searches = match input.get("tool_name")?.as_str()? {
+        "Grep" => vec![(tool_input.get("pattern")?.as_str()?.to_owned(), tool_input.get("path").and_then(Value::as_str).map(|path| cwd.join(path)).unwrap_or(cwd))],
+        "Bash" => searched(tool_input.get("command")?.as_str()?, &cwd),
         _ => return None,
     };
-    let name = searched_name(&pattern)?;
-    let repo = repo_root(if place.is_file() { place.parent()? } else { &place })?;
-    let answers = ask(&repo, vec![name.clone()], SEARCH_BUDGET, false)?;
-    Some(format!("scout: who calls `{name}` (exact, with entry points; unresolved lines are listed for reading, never dropped). For callers, `scout callers` answers more completely than a text search:\n{answers}"))
-}
-
-/// The pattern and the place searched by `rg ...`, `grep ...`, `git grep ...`, `ag ...` in a shell command: the
-/// first argument that is not an option, and the first path after it (else the directory a `cd` moved to).
-fn searched(command: &str, cwd: &Path) -> Option<(String, PathBuf)> {
-    let words = shell_words(command);
-    let mut directory = cwd.to_path_buf();
-    for pair in words.windows(2) {
-        if pair[0] == "cd" {
-            directory = directory.join(&pair[1]);
+    let mut names: Vec<String> = Vec::new();
+    let mut repo = None;
+    for (pattern, place) in searches {
+        let Some(name) = searched_name(&pattern) else { continue };
+        if place.is_file() && !holds_code(&place) {
+            continue;
+        }
+        let Some(place_repo) = repo_root(if place.is_file() { place.parent()? } else { &place }) else { continue };
+        if repo.get_or_insert_with(|| place_repo.clone()) == &place_repo && !names.contains(&name) && names.len() < MAX_SEARCHED_NAMES {
+            names.push(name);
         }
     }
-    let start = words.iter().position(|word| ["rg", "grep", "egrep", "ag", "ack"].contains(&word.as_str()) || word.ends_with("/rg") || word.ends_with("/grep"))?;
-    let mut rest = words[start + 1..].iter();
+    let repo = repo?;
+    if names.is_empty() {
+        return None;
+    }
+    // A search in a repository whose server is not running starts it: this search goes on alone, the next ones
+    // get answers. Waiting here would make a text search wait for a whole repository to be read.
+    daemon::ensure_running(&repo).ok()?;
+    let answers = ask(&repo, names.clone(), SEARCH_BUDGET, false)?;
+    let listed = names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
+    Some(format!("scout: who calls {listed} (exact, with entry points; unresolved lines are listed for reading, never dropped). For callers, `scout callers` answers more completely than a text search:\n{answers}"))
+}
+
+/// Each code search in a shell command (`rg`, `grep`, `ag`, also inside `$( ... )`): its pattern and place (the
+/// first path after the pattern, else the directory a `cd` moved to). A grep reading another command's output
+/// (`... | grep x`) or keeping the lines that do not match (`-v`) searches no code.
+fn searched(command: &str, cwd: &Path) -> Vec<(String, PathBuf)> {
+    let words = shell_words(command);
+    let mut directory = cwd.to_path_buf();
+    let mut found = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        if word == "cd" {
+            if let Some(target) = words.get(index + 1).filter(|target| !is_separator(target)) {
+                directory = directory.join(target);
+            }
+        }
+        let is_search = ["rg", "grep", "egrep", "ag", "ack"].contains(&word.as_str()) || word.ends_with("/rg") || word.ends_with("/grep");
+        let reads_output = index > 0 && words[index - 1] == "|";
+        if is_search && !reads_output {
+            let arguments: Vec<&String> = words[index + 1..].iter().take_while(|word| !is_separator(word)).collect();
+            found.extend(one_search(&arguments, &directory));
+        }
+    }
+    found
+}
+
+/// Whether a file searched by name can hold calls: settings, notes, data and logs cannot.
+fn holds_code(file: &Path) -> bool {
+    let name = file.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let extension = file.extension().map(|extension| extension.to_string_lossy().to_lowercase()).unwrap_or_default();
+    !name.starts_with(".env") && !["md", "txt", "json", "yml", "yaml", "toml", "ini", "log", "csv", "lock", "xml", "sql", "neon"].contains(&extension.as_str())
+}
+
+fn is_separator(word: &str) -> bool {
+    word == "|" || word == ";"
+}
+
+fn one_search(arguments: &[&String], directory: &Path) -> Option<(String, PathBuf)> {
+    let mut rest = arguments.iter();
     let mut pattern = None;
     while let Some(word) = rest.next() {
-        if word == "-e" || word == "--regexp" {
-            pattern = rest.next().cloned();
+        if ["-v", "--invert-match", "--files-without-match"].contains(&word.as_str()) {
+            return None;
+        }
+        if *word == "-e" || *word == "--regexp" {
+            pattern = rest.next().map(|word| (*word).clone());
             break;
         }
         if word.starts_with('-') {
@@ -117,34 +174,49 @@ fn searched(command: &str, cwd: &Path) -> Option<(String, PathBuf)> {
             }
             continue;
         }
-        pattern = Some(word.clone());
+        pattern = Some((*word).clone());
         break;
     }
-    let place = rest.find(|word| !word.starts_with('-')).map(|path| directory.join(path)).unwrap_or(directory);
+    let place = rest.find(|word| !word.starts_with('-')).map(|path| directory.join(path)).unwrap_or_else(|| directory.to_path_buf());
     Some((pattern?, place))
 }
 
-/// Words of a command line, with simple quoting undone (enough to find a search pattern).
+/// Words of a command line, with simple quoting undone (enough to find search patterns). A pipe becomes the word
+/// `|`; every other end of a command (`;`, `&&`, `||`, a newline, `(`, `)`, `$(`, a backtick) becomes `;`.
 fn shell_words(command: &str) -> Vec<String> {
-    let mut words = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
+    let end_word = |word: &mut String, words: &mut Vec<String>| {
+        if !word.is_empty() {
+            words.push(std::mem::take(word));
+        }
+    };
     for character in command.chars() {
         match (quote, character) {
             (Some(open), close) if open == close => quote = None,
             (Some(_), _) => word.push(character),
             (None, '\'' | '"') => quote = Some(character),
-            (None, ' ' | '\t' | '\n' | ';' | '|' | '&') => {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
+            (None, ' ' | '\t') => end_word(&mut word, &mut words),
+            (None, '|') => {
+                end_word(&mut word, &mut words);
+                // `||` runs the next command on failure: an end, not a pipe.
+                if words.last().is_some_and(|last| last == "|") {
+                    *words.last_mut().unwrap() = ";".to_owned();
+                } else {
+                    words.push("|".to_owned());
+                }
+            }
+            (None, ';' | '&' | '\n' | '(' | ')' | '`') => {
+                end_word(&mut word, &mut words);
+                if words.last().is_none_or(|last| last != ";") {
+                    words.push(";".to_owned());
                 }
             }
             (None, _) => word.push(character),
         }
     }
-    if !word.is_empty() {
-        words.push(word);
-    }
+    end_word(&mut word, &mut words);
     words
 }
 
@@ -152,6 +224,12 @@ fn shell_words(command: &str) -> Vec<String> {
 /// or None when it looks for something else (a phrase, a regex, a word too short to mean one function).
 fn searched_name(pattern: &str) -> Option<String> {
     let mut name = pattern.trim().to_owned();
+    // `public static function save`, `pub async fn save`: the modifiers before the keyword say nothing of the name.
+    for modifier in ["public ", "private ", "protected ", "static ", "final ", "abstract ", "pub ", "pub(crate) ", "async ", "export ", "default "] {
+        while let Some(rest) = name.strip_prefix(modifier) {
+            name = rest.trim_start().to_owned();
+        }
+    }
     for prefix in ["function ", "def ", "fn ", "func ", "->", "?->", "::", ".", "\\.", "\\b"] {
         name = name.strip_prefix(prefix).unwrap_or(&name).to_owned();
     }
@@ -166,7 +244,7 @@ fn repo_root(start: &Path) -> Option<PathBuf> {
     start.canonicalize().ok()?.ancestors().find(|directory| directory.join(".git").exists()).map(Path::to_path_buf)
 }
 
-/// Direct callers of each question, within the time budget; None when nothing useful came back in time. `start`
+/// Direct callers of each question, all within one time budget; None when nothing useful came back in time. `start`
 /// lets the question start a server for the repository (it keeps reading the code for the next one).
 fn ask(repo: &Path, questions: Vec<String>, budget: Duration, start: bool) -> Option<String> {
     let (sender, answers) = mpsc::channel();
@@ -181,7 +259,8 @@ fn ask(repo: &Path, questions: Vec<String>, budget: Duration, start: bool) -> Op
         }
     });
     let mut text = Vec::new();
-    while let Ok(answer) = answers.recv_timeout(budget) {
+    let deadline = std::time::Instant::now() + budget;
+    while let Ok(answer) = answers.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
         let Ok(response) = answer else { continue };
         // A file-level symbol, one nobody calls, or calls found by name alone (what the search itself prints)
         // add nothing worth the context.
@@ -204,7 +283,7 @@ fn ask(repo: &Path, questions: Vec<String>, budget: Duration, start: bool) -> Op
 
 /// Hook entries this tool owns in Claude Code's settings, recognized by their command.
 fn owned(entry: &Value) -> bool {
-    entry.get("hooks").and_then(Value::as_array).into_iter().flatten().any(|hook| hook.get("command").and_then(Value::as_str).is_some_and(|command| command.contains(" hook after-edit") || command.contains(" hook before-search")))
+    entry.get("hooks").and_then(Value::as_array).into_iter().flatten().any(|hook| hook.get("command").and_then(Value::as_str).is_some_and(|command| command.contains(" hook after-edit") || command.contains(" hook before-search") || command.contains(" hook session-start")))
 }
 
 /// Adds (or with `remove`, takes out) this tool's hooks in `settings`, leaving every other hook as it was.
@@ -215,7 +294,7 @@ pub fn configured(settings: &Value, binary: &str, remove: bool) -> Option<Value>
         updated = json!({});
     }
     let hooks = updated.as_object_mut()?.entry("hooks").or_insert_with(|| json!({}));
-    let wanted = [("PreToolUse", "Grep|Bash", "before-search"), ("PostToolUse", "Edit|MultiEdit", "after-edit")];
+    let wanted = [("PreToolUse", "Grep|Bash", "before-search"), ("PostToolUse", "Edit|MultiEdit", "after-edit"), ("SessionStart", "startup|resume", "session-start")];
     for (event, matcher, mode) in wanted {
         let entries = hooks.as_object_mut()?.entry(event).or_insert_with(|| json!([])).as_array_mut()?;
         entries.retain(|entry| !owned(entry));
