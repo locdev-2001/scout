@@ -200,10 +200,19 @@ final class ForkedWorker
         return $data;
     }
 
-    /** CPU time a process used so far (Linux); null where it cannot be read, so only silence counts there. */
+    /** CPU time a process used so far (Linux, macOS); null where it cannot be read, so only silence counts there. */
     private static function cpuTicks(int $pid): ?int
     {
         $stat = $pid > 0 ? @file_get_contents("/proc/{$pid}/stat") : false;
+        if ($stat === false && $pid > 0 && PHP_OS_FAMILY === 'Darwin') {
+            // No /proc: `ps` once a second, only while waiting on a quiet child. `[[hh:]mm:]ss.cc`, in hundredths.
+            $time = trim((string) shell_exec("ps -o cputime= -p {$pid} 2>/dev/null"));
+            if (preg_match('/^(?:(\d+):)?(\d+):(\d+)\.(\d+)$/', $time, $match) !== 1) {
+                return null;
+            }
+
+            return ((((int) $match[1] * 60 + (int) $match[2]) * 60 + (int) $match[3]) * 100) + (int) substr($match[4].'0', 0, 2);
+        }
         if ($stat === false) {
             return null;
         }

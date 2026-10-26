@@ -1,12 +1,27 @@
-//! CPU and memory of the server and its drivers, read from /proc, so every answer can state what it cost.
+//! CPU and memory of the server and its drivers, read from /proc (Linux) or libproc (macOS), so every answer can
+//! state what it cost.
 
 use std::fs;
 use std::time::Instant;
 
-/// Linux reports CPU time in clock ticks; USER_HZ is 100 on every mainstream Linux build.
+/// Linux reports CPU time in clock ticks; USER_HZ is 100 on every mainstream Linux build. macOS time is counted in
+/// the same unit.
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 
+/// User and system time of the process itself.
+#[cfg(target_os = "macos")]
+fn cpu_ticks(pid: u32) -> u64 {
+    libproc::task_info(pid).map_or(0, |info| (info.total_user + info.total_system) * CLOCK_TICKS_PER_SECOND / 1_000_000_000)
+}
+
+/// Resident set size: on macOS a page a forked worker shares with its parent counts in both.
+#[cfg(target_os = "macos")]
+fn memory_kb(pid: u32) -> u64 {
+    libproc::task_info(pid).map_or(0, |info| info.resident_bytes / 1024)
+}
+
 /// utime + stime + cutime + cstime: own CPU plus that of children already waited for (forked workers).
+#[cfg(not(target_os = "macos"))]
 fn cpu_ticks(pid: u32) -> u64 {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { return 0 };
     let Some(after_name) = stat.rfind(')').map(|index| &stat[index + 2..]) else { return 0 };
@@ -16,6 +31,7 @@ fn cpu_ticks(pid: u32) -> u64 {
 /// Proportional set size: memory a process shares with its forks (PHP workers) counts once across them, so
 /// the sum over the server and everything it started is what the machine actually spends. RSS where the
 /// kernel has no `smaps_rollup`.
+#[cfg(not(target_os = "macos"))]
 fn memory_kb(pid: u32) -> u64 {
     let field = |file: &str, name: &str| {
         fs::read_to_string(format!("/proc/{pid}/{file}"))
@@ -46,6 +62,67 @@ mod libproc {
 
     extern "C" {
         fn proc_listchildpids(ppid: i32, buffer: *mut c_void, buffersize: i32) -> i32;
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut c_void, buffersize: i32) -> i32;
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+
+    const PROC_PIDTASKINFO: i32 = 4;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+
+    /// `struct proc_taskinfo` of <sys/proc_info.h>.
+    #[allow(dead_code)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcTaskInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        total_user: u64,
+        total_system: u64,
+        threads_user: u64,
+        threads_system: u64,
+        policy: i32,
+        faults: i32,
+        pageins: i32,
+        cow_faults: i32,
+        messages_sent: i32,
+        messages_received: i32,
+        syscalls_mach: i32,
+        syscalls_unix: i32,
+        csw: i32,
+        threadnum: i32,
+        numrunning: i32,
+        priority: i32,
+    }
+
+    pub struct TaskInfo {
+        pub resident_bytes: u64,
+        /// Nanoseconds.
+        pub total_user: u64,
+        pub total_system: u64,
+    }
+
+    /// Memory and CPU time of one process. The kernel counts CPU time in Mach time units (not nanoseconds on Apple
+    /// silicon): converted here.
+    pub fn task_info(pid: u32) -> Option<TaskInfo> {
+        let mut info = ProcTaskInfo::default();
+        let size = std::mem::size_of::<ProcTaskInfo>() as i32;
+        // SAFETY: `info` is a `proc_taskinfo` of `size` bytes; the call writes at most that many.
+        if unsafe { proc_pidinfo(pid as i32, PROC_PIDTASKINFO, 0, (&mut info as *mut ProcTaskInfo).cast(), size) } != size {
+            return None;
+        }
+        let mut timebase = Timebase::default();
+        // SAFETY: writes the two fields of `timebase`.
+        if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+            timebase = Timebase { numer: 1, denom: 1 };
+        }
+        let nanoseconds = |units: u64| (units as u128 * timebase.numer as u128 / timebase.denom as u128) as u64;
+        Some(TaskInfo { resident_bytes: info.resident_size, total_user: nanoseconds(info.total_user), total_system: nanoseconds(info.total_system) })
     }
 
     pub fn children(pid: u32) -> Vec<u32> {
@@ -74,7 +151,7 @@ fn children_of(pid: u32) -> Vec<u32> {
 }
 
 /// Tells a process tree that is working on an answer from one that waits for something that will never come:
-/// on Linux by its CPU time, elsewhere (no /proc) only by a long wall-clock limit.
+/// on Linux and macOS by its CPU time, elsewhere only by a long wall-clock limit.
 pub struct Progress {
     pid: u32,
     ticks: Option<u64>,
@@ -92,7 +169,7 @@ impl Progress {
     }
 
     fn tree_ticks(pid: u32) -> Option<u64> {
-        cfg!(target_os = "linux").then(|| with_descendants(vec![pid]).into_iter().map(cpu_ticks).sum())
+        cfg!(any(target_os = "linux", target_os = "macos")).then(|| with_descendants(vec![pid]).into_iter().map(cpu_ticks).sum())
     }
 
     /// Whether the tree has done nothing for too long; called while waiting.
@@ -113,6 +190,12 @@ impl Progress {
 
 /// What each process of a tree is doing, one line each (`pid state wait-channel command`), for the log of a hang.
 pub fn describe_tree(pid: u32) -> String {
+    if !cfg!(target_os = "linux") {
+        // No /proc: one `ps` over the whole tree (only ever run when a driver hangs).
+        let pids: Vec<String> = with_descendants(vec![pid]).into_iter().map(|pid| pid.to_string()).collect();
+        let listed = std::process::Command::new("ps").args(["-o", "pid=,stat=,wchan=,command=", "-p", &pids.join(",")]).output().map(|output| String::from_utf8_lossy(&output.stdout).into_owned()).unwrap_or_default();
+        return listed.lines().map(|line| format!("  {}", line.trim().chars().take(200).collect::<String>())).collect::<Vec<_>>().join("\n");
+    }
     let read = |pid: u32, file: &str| fs::read_to_string(format!("/proc/{pid}/{file}")).unwrap_or_default();
     with_descendants(vec![pid])
         .into_iter()
@@ -164,8 +247,10 @@ impl QueryCost {
         let restarted = if restarted { ", a driver restarted" } else { "" };
         if cfg!(target_os = "linux") {
             format!("Cost: {wall_ms:.0} ms wall, ~{cpu_ms} ms CPU (10 ms resolution), {memory_mb:.0} MB memory (proportional: server, drivers and what they started){restarted}")
+        } else if cfg!(target_os = "macos") {
+            format!("Cost: {wall_ms:.0} ms wall, ~{cpu_ms} ms CPU (10 ms resolution), {memory_mb:.0} MB memory (resident: server, drivers and what they started; pages a fork shares count twice){restarted}")
         } else {
-            // CPU and memory of other processes are read from /proc, which only Linux has.
+            // CPU and memory of other processes are read from /proc or libproc, which only Linux and macOS have.
             format!("Cost: {wall_ms:.0} ms wall (CPU and memory not measured on this OS){restarted}")
         }
     }
