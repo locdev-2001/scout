@@ -71,15 +71,15 @@ final class ForkedWorker
     }
 
     /**
-     * Starts $work in a child at the lowest CPU priority and returns at once; feed the stream to
+     * Starts $work in a child, at the lowest CPU priority unless said otherwise, and returns at once; feed the stream to
      * readAvailable() when it is readable until it returns the result.
      *
      * @return array{0: int, 1: resource, 2: string}
      */
-    public static function startBackground(callable $work, string $label = 'background'): array
+    public static function startBackground(callable $work, string $label = 'background', bool $lowPriority = true): array
     {
-        [$pid, $stream] = self::start(function () use ($work) {
-            if (! self::inline() && function_exists('proc_nice')) {
+        [$pid, $stream] = self::start(function () use ($work, $lowPriority) {
+            if ($lowPriority && ! self::inline() && function_exists('proc_nice')) {
                 proc_nice(19);
             }
 
