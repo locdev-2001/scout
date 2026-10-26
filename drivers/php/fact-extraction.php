@@ -379,13 +379,15 @@ final class FactExtraction
             return null;
         }
         $owner = $file->tokens[$index - 2] ?? null;
-        $kind = $this->storedInProperty($file, $index) ? 'stored callable' : 'callable';
+        // Only once the string has an owner: storedInProperty() walks back to the statement's start, and a
+        // translation file is one statement whose every key is a name after a comma.
+        $kind = fn () => $this->storedInProperty($file, $index) ? 'stored callable' : 'callable';
         if ($owner?->id === T_CLASS && ($file->tokens[$index - 3]->text ?? '') === '::') {
-            return [strtolower($literal), $kind, $this->inference->staticReceiverTypes($file, $index - 4)];
+            return [strtolower($literal), $kind(), $this->inference->staticReceiverTypes($file, $index - 4)];
         }
         $property = $owner !== null && isIdentifierText($owner->text) && in_array($file->tokens[$index - 3]->text ?? '', ['->', '?->'], true);
         if ($owner?->id === T_VARIABLE || $property) {
-            return [strtolower($literal), $kind, $this->inference->expressionTypes($file, $index - 2)];
+            return [strtolower($literal), $kind(), $this->inference->expressionTypes($file, $index - 2)];
         }
 
         return null;
