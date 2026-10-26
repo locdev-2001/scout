@@ -1,0 +1,54 @@
+# Installs scout on a fresh macOS and Linux machine and uses it on real code (its own Rust and Python, a small
+# PHP and TypeScript project), printing the answers to compare. Started by hand from the Actions tab.
+name: Try on macOS and Linux
+on: workflow_dispatch
+jobs:
+  try:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: pcntl, posix
+          tools: composer
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: rustup component add rust-analyzer
+      - run: ./install.sh
+      - name: Use scout
+        shell: bash
+        run: |
+          set -u
+          scout="$GITHUB_WORKSPACE/scout"; samples="$RUNNER_TEMP/samples"; source_root="$GITHUB_WORKSPACE"
+          rm -rf "$samples" && mkdir -p "$samples/php/src" "$samples/ts/src"
+          cd "$samples/php"
+          printf '{"autoload":{"psr-4":{"App\\\\":"src/"}}}\n' > composer.json
+          printf '<?php\n\nnamespace App;\n\nclass Price\n{\n    public function total(int $amount): int\n    {\n        return $amount * 2;\n    }\n}\n' > src/Price.php
+          printf '<?php\n\nnamespace App;\n\nclass Cart\n{\n    public function checkout(Price $price): int\n    {\n        return $price->total(3) + (new Price())->total(1);\n    }\n}\n' > src/Cart.php
+          composer dump-autoload -q
+          git init -q && git add -A
+          cd "$samples/ts"
+          printf '{"name":"sample","private":true,"type":"module"}\n' > package.json
+          printf 'export function total(amount: number): number {\n  return amount * 2;\n}\n' > src/price.ts
+          printf "import { total } from './price';\n\nexport const checkout = () => total(3);\n" > src/cart.ts
+          git init -q && git add -A
+          run() { echo "== $1  $2"; (cd "$1" && "$scout" callers "$2" --depth 1 --compact 2>&1 | grep -E '^- |^Total|^Cost|Not found|^Warning'); }
+          run "$samples/php" 'App\Price::total'
+          run "$samples/ts" 'src/price.ts#total'
+          run "$source_root" 'src/resources.rs#kill_tree'
+          run "$source_root" 'drivers/python/driver.py#stamp'
+          run "$source_root" 'src/resources.rs#kill_tree'
+          "$scout" stop >/dev/null
+          for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -x rust-analyzer >/dev/null || pgrep -f '[s]cout serve' >/dev/null || break; sleep 1; done
+          echo "== left after stop: rust-analyzer $(pgrep -x rust-analyzer | wc -l | tr -d ' '), scout servers $(pgrep -f '[s]cout serve' | wc -l | tr -d ' ')"
+          "$scout" status
+          ps -axo pid,ppid,comm | grep -E 'rust-analyzer|scout|driver' | grep -v grep || echo "no scout or rust-analyzer process left"
