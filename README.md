@@ -118,4 +118,5 @@ Phần "Affected entry points" là những lối vào bị ảnh hưởng: route
 - MDX: chỉ đọc phần `import`/`export` và các thẻ component (`<Callout>`); biểu thức `{...}` giữa văn bản thì không.
 - PHP dự án lớn: lần đầu tiến trình nền đọc hết mọi file (khoảng 30 giây với 5.000 file). Câu hỏi đến trong lúc đó vẫn đúng nhưng mất vài giây; sau đó mỗi câu vài chục mili giây. Python cũng đọc trước như vậy, bằng vài tiến trình con (khoảng 12 giây với 8.400 file).
 - Một câu hỏi rất rộng (không giới hạn `--depth` trên hàm dùng khắp nơi) dừng sau 10 giây, trả phần đã đi được và nói rõ chỗ bị cắt; hỏi tiếp về một người gọi trong đó để đi sâu hơn. Nếu bạn ngắt lệnh, tiến trình nền dừng câu đó ngay, không bắt câu sau phải chờ.
+- PHP dùng `rg` (ripgrep) để tìm file nhanh nếu máy có; không có thì scout tự đọc file, cùng kết quả nhưng câu đầu chậm hơn (backend Laravel 5.000 file: khoảng 9 giây thay vì 3).
 - Trên Windows, PHP không có `pcntl`: scout vẫn đúng nhưng sau mỗi lần sửa file PHP sẽ chậm (driver PHP khởi động lại).

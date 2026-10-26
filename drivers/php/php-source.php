@@ -546,12 +546,66 @@ final class PhpFileCache
     /** @return list<string> every PHP file of the repo that version control does not ignore */
     public function phpFiles(): array
     {
-        $process = proc_open(['rg', '--files', '--type', 'php'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $this->repoRoot);
-        $output = stream_get_contents($pipes[1]);
+        $output = self::hasRipgrep()
+            ? $this->runHere(['rg', '--files', '--hidden', '--type', 'php'])
+            : str_replace("\0", "\n", $this->runHere(['git', 'ls-files', '-co', '--exclude-standard', '-z', '--', '*.php', '*.phtml']));
+
+        return array_values(array_filter(explode("\n", $output), fn (string $line) => $line !== ''));
+    }
+
+    /** Whether ripgrep is on PATH; without it the files are listed by git and searched here (slower, same answer). */
+    private static function hasRipgrep(): bool
+    {
+        static $found = null;
+        if ($found === null) {
+            $found = false;
+            foreach (explode(PATH_SEPARATOR, (string) getenv('PATH')) as $folder) {
+                $found = $found || ($folder !== '' && (is_executable("{$folder}/rg") || is_executable("{$folder}/rg.exe")));
+            }
+        }
+
+        return $found;
+    }
+
+    /** @param  list<string>  $command */
+    private function runHere(array $command): string
+    {
+        $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $this->repoRoot);
+        if (! is_resource($process)) {
+            throw new RuntimeException("cannot run {$command[0]}");
+        }
+        $output = (string) stream_get_contents($pipes[1]);
         stream_get_contents($pipes[2]);
         proc_close($process);
 
-        return array_values(array_filter(explode("\n", $output), fn (string $line) => $line !== ''));
+        return $output;
+    }
+
+    /**
+     * What `rg --files-with-matches` would list for these arguments (`-e`, `--ignore-case`, `--word-regexp`,
+     * `--fixed-strings`), found by reading the files.
+     *
+     * @param  list<string>  $arguments
+     * @param  list<string>  $paths
+     * @return list<string>
+     */
+    private function searchHere(array $arguments, array $paths): array
+    {
+        $patterns = [];
+        foreach ($arguments as $position => $argument) {
+            if ($argument === '-e') {
+                $patterns[] = $arguments[$position + 1];
+            }
+        }
+        $fixed = in_array('--fixed-strings', $arguments, true);
+        $alternatives = array_map(fn (string $pattern) => $fixed ? preg_quote($pattern, '#') : str_replace('#', '\\#', $pattern), $patterns);
+        $expression = '(?:'.implode('|', $alternatives).')';
+        if (in_array('--word-regexp', $arguments, true)) {
+            $expression = "\\b{$expression}\\b";
+        }
+        $regex = '#'.$expression.'#'.(in_array('--ignore-case', $arguments, true) ? 'i' : '');
+
+        return array_values(array_filter($paths, fn (string $path) => preg_match($regex, (string) @file_get_contents("{$this->repoRoot}/{$path}")) === 1));
     }
 
     /**
@@ -566,14 +620,9 @@ final class PhpFileCache
         if ($paths === []) {
             return [];
         }
-        $command = ['rg', '--files-with-matches', '--no-messages', '--type', 'php', ...$arguments, '--', ...($paths ?? ['.'])];
-        $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $this->repoRoot);
-        if (! is_resource($process)) {
-            throw new RuntimeException('cannot run rg');
-        }
-        $output = stream_get_contents($pipes[1]);
-        stream_get_contents($pipes[2]);
-        proc_close($process);
+        $output = self::hasRipgrep()
+            ? $this->runHere(['rg', '--files-with-matches', '--no-messages', '--hidden', '--type', 'php', ...$arguments, '--', ...($paths ?? ['.'])])
+            : implode("\n", $this->searchHere($arguments, $paths ?? $this->phpFiles()));
 
         $files = [];
         foreach (explode("\n", trim($output)) as $line) {
