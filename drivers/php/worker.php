@@ -135,7 +135,7 @@ final class ForkedWorker
         [$parentEnd, $childEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $pid = pcntl_fork();
         if ($pid === -1) {
-            throw new RuntimeException('cannot fork');
+            throw new RuntimeException('cannot fork: '.pcntl_strerror(pcntl_get_last_error()));
         }
         if ($pid === 0) {
             fclose($parentEnd);
@@ -310,11 +310,14 @@ final class WorkerPool
     /** @return array{0: int, 1: resource} */
     private function spawn(): array
     {
+        // A long question forks many one-shot workers: without this, the ones already gone pile up as zombies
+        // until it ends and can reach the per-user process limit.
+        ForkedWorker::reapFinished();
         [$parentEnd, $childEnd] = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
         $parent = getmypid();
         $pid = pcntl_fork();
         if ($pid === -1) {
-            throw new RuntimeException('cannot fork');
+            throw new RuntimeException('cannot fork: '.pcntl_strerror(pcntl_get_last_error()));
         }
         if ($pid === 0) {
             // Drop inherited streams (other workers' sockets, the warm-up's), so no process outlives its peer.
