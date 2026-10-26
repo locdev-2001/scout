@@ -174,7 +174,9 @@ pub fn status() -> Result<u8, String> {
     let home = home()?;
     println!("scout: {}", launcher()?.display());
     let contains = |path: PathBuf, needle: &str| fs::read_to_string(path).is_ok_and(|text| text.contains(needle));
-    println!("  Claude Code MCP:   {}", if contains(home.join(".claude.json"), "scout") { "registered" } else { "not registered" });
+    // The user-scope server `setup` adds, not any mention of scout (skill usage, project paths) elsewhere in the file.
+    let claude_mcp = fs::read_to_string(home.join(".claude.json")).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()).is_some_and(|config| config.pointer("/mcpServers/scout").is_some());
+    println!("  Claude Code MCP:   {}", if claude_mcp { "registered" } else { "not registered" });
     println!("  Claude Code hooks: {}", if contains(home.join(".claude/settings.json"), " hook after-edit") { "installed" } else { "not installed" });
     println!("  Codex MCP:         {}", if contains(home.join(".codex/config.toml"), "mcp_servers.scout") { "registered" } else { "not registered" });
     let cache = daemon::cache_directory();
