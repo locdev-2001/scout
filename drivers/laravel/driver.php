@@ -59,6 +59,7 @@ final class LaravelWiring implements BackgroundWork
     public function sync(array $changed): array
     {
         $this->guard->apply($changed, self::RESTART_INPUTS);
+        $this->files->changed($changed);
         if ($changed !== []) {
             $this->bootFailure = null;
         }

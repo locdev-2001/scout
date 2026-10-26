@@ -478,7 +478,37 @@ final class PhpFileCache
     /** @var list<string>|null paths Composer autoloads only for development: tests and their helpers */
     private ?array $testPaths = null;
 
+    /** @var array<string, list<int>>|null without ripgrep: lowercase word => ids of the files it appears in */
+    private ?array $wordIndex = null;
+
+    /** @var list<string> the files the word index was built from, by id */
+    private array $indexedFiles = [];
+
+    /** @var array<string, true> files changed since the word index was built: always searched by reading them */
+    private array $changedSinceIndex = [];
+
     public function __construct(public readonly string $repoRoot) {}
+
+    /**
+     * Files the core reported changed (added, removed or edited), so the word index never answers from old text.
+     *
+     * @param  list<string>  $paths
+     */
+    public function changed(array $paths): void
+    {
+        if ($this->wordIndex === null) {
+            return;
+        }
+        foreach ($paths as $path) {
+            if (basename($path) === '.gitignore') {
+                // What counts as a repo file may have changed anywhere: build the index again when next needed.
+                [$this->wordIndex, $this->indexedFiles, $this->changedSinceIndex] = [null, [], []];
+
+                return;
+            }
+            $this->changedSinceIndex[$path] = true;
+        }
+    }
 
     /** Whether a file belongs to the tests (a helper trait in tests/ included, not only test classes). */
     public function isTestPath(string $relativePath): bool
@@ -609,6 +639,59 @@ final class PhpFileCache
     }
 
     /**
+     * Without ripgrep, a whole-word search would read every PHP file for each name a question looks up. The files
+     * that can match a word are those where it appears between non-word characters, found in an index of every
+     * word, built once; searchHere() then checks only those, so the answer is the same. Null when the search is
+     * not for whole words made of `\w` characters.
+     *
+     * @param  list<string>  $arguments
+     * @return list<string>|null
+     */
+    private function candidates(array $arguments): ?array
+    {
+        if (! in_array('--word-regexp', $arguments, true) || ! in_array('--fixed-strings', $arguments, true)) {
+            return null;
+        }
+        $words = [];
+        foreach ($arguments as $position => $argument) {
+            if ($argument === '-e') {
+                $word = (string) ($arguments[$position + 1] ?? '');
+                if (preg_match('/^\w+$/', $word) !== 1) {
+                    return null;
+                }
+                $words[] = strtolower($word);
+            }
+        }
+        if ($this->wordIndex === null) {
+            $this->buildWordIndex();
+        }
+        $found = [];
+        foreach ($words as $word) {
+            foreach ($this->wordIndex[$word] ?? [] as $id) {
+                $found[$this->indexedFiles[$id]] = true;
+            }
+        }
+        foreach (array_keys($this->changedSinceIndex) as $path) {
+            $found[$path] = is_file("{$this->repoRoot}/{$path}") && preg_match('/\.(php|phtml)$/i', $path) === 1;
+        }
+
+        return array_keys(array_filter($found));
+    }
+
+    private function buildWordIndex(): void
+    {
+        $started = microtime(true);
+        [$this->wordIndex, $this->indexedFiles, $this->changedSinceIndex] = [[], $this->phpFiles(), []];
+        foreach ($this->indexedFiles as $id => $path) {
+            preg_match_all('/\w+/', (string) @file_get_contents("{$this->repoRoot}/{$path}"), $matches);
+            foreach (array_unique(array_map('strtolower', $matches[0])) as $word) {
+                $this->wordIndex[$word][] = $id;
+            }
+        }
+        profilePhase('word index: built', $started, ['files' => count($this->indexedFiles), 'words' => count($this->wordIndex)]);
+    }
+
+    /**
      * Files under the repo matching every pattern set, using ripgrep (honours .gitignore, so vendor/ is skipped).
      *
      * @param  list<string>  $arguments
@@ -622,7 +705,7 @@ final class PhpFileCache
         }
         $output = self::hasRipgrep()
             ? $this->runHere(['rg', '--files-with-matches', '--no-messages', '--hidden', '--type', 'php', ...$arguments, '--', ...($paths ?? ['.'])])
-            : implode("\n", $this->searchHere($arguments, $paths ?? $this->phpFiles()));
+            : implode("\n", $this->searchHere($arguments, $paths ?? $this->candidates($arguments) ?? $this->phpFiles()));
 
         $files = [];
         foreach (explode("\n", trim($output)) as $line) {

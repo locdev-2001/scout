@@ -151,6 +151,7 @@ final class FactStore implements BackgroundWork
     {
         $syncStarted = microtime(true);
         $this->guard->apply($changed, self::RESTART_INPUTS);
+        $this->files->changed($changed);
         $root = $this->files->repoRoot;
         $contentChanged = [];
         foreach ($changed as $path) {
