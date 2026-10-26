@@ -32,8 +32,16 @@ final class LaravelWiring implements BackgroundWork
     /** @var array{routes: array, listeners: array, commands: array, deps: list<string>, dirs: list<string>}|null */
     private ?array $wiring = null;
 
-    /** Why the last boot failed (an app that reaches a database it cannot open while booting): kept until a file changes, so one question does not boot once per symbol. */
-    private ?string $bootFailure = null;
+    /**
+     * Why the last boot failed (an app that reaches a database it cannot open while booting), and when: kept until a
+     * file changes or for BOOT_RETRY_SECONDS, so one question does not boot once per symbol and a database that comes
+     * back is seen.
+     *
+     * @var array{0: string, 1: float}|null
+     */
+    private ?array $bootFailure = null;
+
+    private const BOOT_RETRY_SECONDS = 30;
 
     /** @var array<string, list<array>> symbol => caller edges, valid until the wiring or a class it used changes */
     private array $callersCache = [];
@@ -315,8 +323,8 @@ final class LaravelWiring implements BackgroundWork
     private function wiring(): array
     {
         if ($this->wiring === null) {
-            if ($this->bootFailure !== null) {
-                throw new RuntimeException($this->bootFailure);
+            if ($this->bootFailure !== null && microtime(true) - $this->bootFailure[1] < self::BOOT_RETRY_SECONDS) {
+                throw new RuntimeException($this->bootFailure[0]);
             }
             $root = $this->files->repoRoot;
             $files = $this->files;
@@ -324,7 +332,7 @@ final class LaravelWiring implements BackgroundWork
             try {
                 $this->wiring = ForkedWorker::run(fn () => self::boot($root, $files));
             } catch (RuntimeException $error) {
-                $this->bootFailure = $error->getMessage();
+                $this->bootFailure = [$error->getMessage(), microtime(true)];
 
                 throw $error;
             }

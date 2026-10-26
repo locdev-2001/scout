@@ -772,6 +772,11 @@ final class FactStore implements BackgroundWork
             return;
         }
         $root = $this->files->repoRoot;
+        // A saved file no longer among the repo's PHP files (ignored since, for example) would keep facts a fresh
+        // start does not read: read all again.
+        if (array_diff_key($saved['files'], array_flip($phpFiles)) !== []) {
+            return;
+        }
         // Files outside the repo's PHP files that facts were built on (vendor code): any change there, read all again.
         foreach ($saved['outside'] as $path => $hash) {
             if (FactExtraction::contentHash("{$root}/{$path}") !== $hash) {
