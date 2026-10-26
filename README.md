@@ -49,10 +49,10 @@ scout callers X ──► tiến trình nền của dự án ──► driver th
                        cache câu trả lời)           Python · rust-analyzer)
 ```
 
-- Lần hỏi đầu, scout khởi động một tiến trình nền cho dự án. Nó tự tắt sau 10 phút không ai hỏi để trả RAM; phiên sau Python/JS khởi động lại nhanh nhờ cache, PHP lớn mất vài giây, Rust lớn 15–40 giây.
+- Lần hỏi đầu, scout khởi động một tiến trình nền cho dự án. Nó tự tắt sau 10 phút không ai hỏi để trả RAM; phiên sau Python/JS/PHP khởi động lại nhanh nhờ cache, Rust lớn 15–40 giây.
 - Tiến trình nền để ý file nào bạn vừa lưu và cập nhật ngay, nên lúc bạn hỏi thì phần lớn việc đã xong. Mỗi lần hỏi nó vẫn kiểm lại nhanh toàn bộ file.
 - Hỏi lại lần hai gần như tức thì: câu trả lời được giữ tới khi file liên quan đổi.
-- Python và JavaScript/TypeScript lưu kết quả đọc file vào `~/.cache/scout` (vài MB đến vài chục MB mỗi dự án). Lần hỏi đầu của phiên sau từ 11–15 giây còn khoảng 1 giây trên dự án 6.000–8.000 file. File đổi trong lúc tiến trình nền tắt vẫn được đọc lại. `scout status` báo dung lượng, `scout uninstall` xoá nó.
+- Python, JavaScript/TypeScript và PHP lưu kết quả đọc file vào `~/.cache/scout` (vài MB đến vài chục MB mỗi dự án). Lần hỏi đầu của phiên sau từ 11–15 giây còn khoảng 1 giây trên dự án 6.000–8.000 file; backend Laravel 5.000 file từ khoảng 90 giây còn khoảng 10 giây. File đổi trong lúc tiến trình nền tắt vẫn được đọc lại. `scout status` báo dung lượng, `scout uninstall` xoá nó.
 
 Mỗi ngôn ngữ hiểu code bằng công cụ của chính nó:
 
@@ -171,7 +171,8 @@ scout nói thẳng chỗ nó không chắc thay vì im lặng bỏ qua.
 - Nếu một file làm PHP dừng hẳn khi nạp, scout báo rõ file đó chưa phân tích được. File thuộc phần test chỉ được báo khi bạn hỏi kèm `--tests`.
 - Laravel gọi nhiều thứ theo quy ước, không viết tên ra. Tool nối được: scope `scopeDangBan` ← `->dangBan()`, accessor `getHoTenAttribute` ← `->ho_ten`, middleware ← các route nó gắn (gom thành một dòng khi nhiều), form request ← action nhận nó, policy ← `authorize('sua', ...)`/`can(...)`, class phía sau facade ← `Cache::remember(...)`, `__call` ← lời gọi method không khai báo, macro (`Builder::macro('tenMacro', ...)` thành method `Builder::tenMacro`) ← mọi `->tenMacro(`.
 - Dự án lớn: lần đầu tiến trình nền đọc hết mọi file (khoảng 30 giây với 5.000 file). Câu hỏi đến trong lúc đó vẫn đúng nhưng mất vài giây; sau đó mỗi câu vài chục mili giây.
-- PHP dùng `rg` (ripgrep) để tìm file nhanh nếu máy có; không có thì scout tự đọc file, cùng kết quả nhưng câu đầu chậm hơn (backend Laravel 5.000 file: khoảng 9 giây thay vì 3).
+- PHP dùng `rg` (ripgrep) để tìm file nhanh nếu máy có; không có thì scout dựng một lần chỉ mục từ → file (khoảng 0,7 giây với 5.000 file) và chỉ đọc những file có chữ cần tìm, cùng kết quả.
+- Laravel: scout khởi động app thật bằng `.env` của dự án, nên app nào truy vấn database lúc khởi động thì scout cũng truy vấn database đó. Khởi động lỗi (ví dụ không vào được database) thì route, sự kiện, lệnh không được nối và câu trả lời có cảnh báo; scout thử lại khi có file đổi hoặc sau 30 giây.
 - Trên Windows, PHP không có `pcntl`: scout vẫn đúng nhưng sau mỗi lần sửa file PHP sẽ chậm (driver PHP khởi động lại).
 
 ### JavaScript, TypeScript và MDX
