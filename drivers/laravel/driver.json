@@ -1,0 +1,46 @@
+{
+  "detect": [
+    {
+      "file": "artisan"
+    },
+    {
+      "file": "composer.json",
+      "contains": "\"laravel/framework\""
+    }
+  ],
+  "ops": [
+    "probe",
+    "sync",
+    "callers"
+  ],
+  "command": [
+    "php",
+    "-d",
+    "display_errors=stderr",
+    "-d",
+    "memory_limit=2G",
+    "-d",
+    "opcache.enable_cli=1",
+    "-d",
+    "opcache.validate_timestamps=1",
+    "-d",
+    "opcache.revalidate_freq=0",
+    "-d",
+    "opcache.file_update_protection=0",
+    "-d",
+    "opcache.memory_consumption=512",
+    "-d",
+    "opcache.interned_strings_buffer=64",
+    "-d",
+    "opcache.max_accelerated_files=100000",
+    "-d",
+    "opcache.jit=disable",
+    "driver.php"
+  ],
+  "requires": [
+    {
+      "file": "vendor/autoload.php",
+      "missing": "run `composer install`"
+    }
+  ]
+}

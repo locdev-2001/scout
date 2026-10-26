@@ -1,0 +1,13 @@
+{
+  "detect": [],
+  "ops": [
+    "probe",
+    "sync",
+    "callers",
+    "locate"
+  ],
+  "command": [
+    "{scout}",
+    "driver-generic"
+  ]
+}

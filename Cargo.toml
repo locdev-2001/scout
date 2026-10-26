@@ -1,0 +1,15 @@
+[package]
+name = "scout"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ignore = "0.4"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
+[profile.release]
+codegen-units = 1
+lto = true

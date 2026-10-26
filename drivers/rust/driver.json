@@ -1,0 +1,67 @@
+{
+  "detect": [
+    {
+      "any": [
+        {
+          "file": "Cargo.toml"
+        },
+        {
+          "extensions": [
+            "rs"
+          ]
+        }
+      ]
+    }
+  ],
+  "ops": [
+    "probe",
+    "sync",
+    "resolve",
+    "locate",
+    "callers"
+  ],
+  "extensions": [
+    "rs"
+  ],
+  "cache": [
+    "callers"
+  ],
+  "command": [
+    "{scout}",
+    "driver-lsp"
+  ],
+  "lsp": {
+    "command": [
+      "rust-analyzer"
+    ],
+    "language_id": "rust",
+    "extensions": [
+      "rs"
+    ],
+    "env": {
+      "CARGO_TARGET_DIR": "{cache}/target",
+      "RUSTUP_AUTO_INSTALL": "0"
+    },
+    "initialization_options": {
+      "checkOnSave": false,
+      "files": {
+        "watcher": "client"
+      },
+      "cargo": {
+        "buildScripts": {
+          "enable": false
+        }
+      },
+      "procMacro": {
+        "enable": false
+      },
+      "cachePriming": {
+        "enable": false
+      }
+    },
+    "project_files": [
+      "Cargo.toml",
+      "Cargo.lock"
+    ]
+  }
+}

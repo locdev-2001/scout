@@ -1,0 +1,23 @@
+{
+  "detect": [
+    {
+      "extensions": [
+        "py"
+      ]
+    }
+  ],
+  "ops": [
+    "probe",
+    "sync",
+    "resolve",
+    "locate",
+    "callers"
+  ],
+  "extensions": [
+    "py"
+  ],
+  "command": [
+    "python3",
+    "driver.py"
+  ]
+}

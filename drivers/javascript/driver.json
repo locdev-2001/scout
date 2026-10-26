@@ -1,0 +1,48 @@
+{
+  "detect": [
+    {
+      "any": [
+        {
+          "file": "package.json"
+        },
+        {
+          "extensions": [
+            "ts",
+            "tsx",
+            "mts",
+            "cts",
+            "vue",
+            "svelte"
+          ]
+        }
+      ]
+    }
+  ],
+  "ops": [
+    "probe",
+    "sync",
+    "resolve",
+    "locate",
+    "callers"
+  ],
+  "extensions": [
+    "js",
+    "jsx",
+    "ts",
+    "tsx",
+    "mjs",
+    "cjs",
+    "mts",
+    "cts",
+    "vue",
+    "svelte",
+    "mdx"
+  ],
+  "command": [
+    "node",
+    "driver.mjs"
+  ],
+  "cache": [
+    "callers"
+  ]
+}
