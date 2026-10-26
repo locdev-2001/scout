@@ -672,7 +672,8 @@ final class PhpFileCache
             }
         }
         foreach (array_keys($this->changedSinceIndex) as $path) {
-            $found[$path] = is_file("{$this->repoRoot}/{$path}") && preg_match('/\.(php|phtml)$/i', $path) === 1;
+            // The extensions phpFiles() lists (git pathspecs are case-sensitive).
+            $found[$path] = is_file("{$this->repoRoot}/{$path}") && preg_match('/\.(php|phtml)$/', $path) === 1;
         }
 
         return array_keys(array_filter($found));

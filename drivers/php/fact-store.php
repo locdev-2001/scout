@@ -778,7 +778,8 @@ final class FactStore implements BackgroundWork
                 return;
             }
         }
-        $changed = array_values(array_diff($phpFiles, array_keys($saved['files'])));
+        // New files (git also lists a tracked file deleted from the working tree: nothing to read there).
+        $changed = array_values(array_filter(array_diff($phpFiles, array_keys($saved['files'])), fn (string $path) => is_file("{$root}/{$path}")));
         foreach ($saved['files'] as $path => $facts) {
             if (FactExtraction::contentHash("{$root}/{$path}") !== $facts['hash']) {
                 $changed[] = $path;
@@ -791,10 +792,11 @@ final class FactStore implements BackgroundWork
             $this->storeFile($path, $facts);
         }
         profilePhase('start: saved facts read', $started, ['files' => count($saved['files']), 'changed' => count($changed)]);
+        // What sync() changes is saved again once the server is idle.
+        $this->savedVersion = $this->factsVersion;
         if ($changed !== []) {
             $this->sync($changed);
         }
-        $this->savedVersion = $this->factsVersion;
     }
 
     private function saveDue(): bool
@@ -803,28 +805,32 @@ final class FactStore implements BackgroundWork
             && ($this->lastSave === null || microtime(true) - $this->lastSave > self::SAVE_INTERVAL_SECONDS);
     }
 
-    /** Writes every file's facts in a forked child, so a question arriving meanwhile is not kept waiting. */
+    /**
+     * Writes every file's facts in a forked child, so a question arriving meanwhile is not kept waiting; the child
+     * converts them from its copy of the memory, which costs the driver nothing.
+     */
     private function save(): void
     {
         $root = $this->files->repoRoot;
-        $files = [];
-        $outside = [];
-        foreach ($this->fileFacts as $path => $facts) {
-            // Back to the form fileFacts() returns, which storeFile() reads.
-            $facts['sites'] = $facts['byName'] === [] ? [] : array_merge(...array_values($facts['byName']));
-            $facts['mentions'] = array_keys($facts['mentions']);
-            unset($facts['byName'], $facts['answerHash']);
-            $files[$path] = $facts;
-            foreach ($facts['deps'] as $dependency) {
-                if (! isset($this->fileFacts[$dependency]) && str_ends_with($dependency, '.php')) {
-                    $outside[$dependency] ??= FactExtraction::contentHash("{$root}/{$dependency}");
-                }
-            }
-        }
+        $stored = $this->fileFacts;
         $path = $this->savedPath();
         $key = $this->savedKey();
-        $job = ForkedWorker::startBackground(function () use ($path, $key, $files, $outside) {
+        $job = ForkedWorker::startBackground(function () use ($root, $stored, $path, $key) {
             $started = microtime(true);
+            $files = [];
+            $outside = [];
+            foreach ($stored as $file => $facts) {
+                // Back to the form fileFacts() returns, which storeFile() reads.
+                $facts['sites'] = $facts['byName'] === [] ? [] : array_merge(...array_values($facts['byName']));
+                $facts['mentions'] = array_keys($facts['mentions']);
+                unset($facts['byName'], $facts['answerHash']);
+                $files[$file] = $facts;
+                foreach ($facts['deps'] as $dependency) {
+                    if (! isset($stored[$dependency]) && str_ends_with($dependency, '.php')) {
+                        $outside[$dependency] ??= FactExtraction::contentHash("{$root}/{$dependency}");
+                    }
+                }
+            }
             @mkdir(dirname($path), 0777, true);
             // A full disk only costs the next server a slower start.
             if (@file_put_contents("{$path}.tmp", gzencode(serialize(['key' => $key, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
