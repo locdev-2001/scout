@@ -32,6 +32,9 @@ final class LaravelWiring implements BackgroundWork
     /** @var array{routes: array, listeners: array, commands: array, deps: list<string>, dirs: list<string>}|null */
     private ?array $wiring = null;
 
+    /** Why the last boot failed (an app that reaches a database it cannot open while booting): kept until a file changes, so one question does not boot once per symbol. */
+    private ?string $bootFailure = null;
+
     /** @var array<string, list<array>> symbol => caller edges, valid until the wiring or a class it used changes */
     private array $callersCache = [];
 
@@ -56,6 +59,9 @@ final class LaravelWiring implements BackgroundWork
     public function sync(array $changed): array
     {
         $this->guard->apply($changed, self::RESTART_INPUTS);
+        if ($changed !== []) {
+            $this->bootFailure = null;
+        }
         $this->forgetScansTouching($changed);
         if ($this->traitJobs !== []) {
             array_push($this->changeHistory, ...$changed);
@@ -308,10 +314,19 @@ final class LaravelWiring implements BackgroundWork
     private function wiring(): array
     {
         if ($this->wiring === null) {
+            if ($this->bootFailure !== null) {
+                throw new RuntimeException($this->bootFailure);
+            }
             $root = $this->files->repoRoot;
             $files = $this->files;
             $started = microtime(true);
-            $this->wiring = ForkedWorker::run(fn () => self::boot($root, $files));
+            try {
+                $this->wiring = ForkedWorker::run(fn () => self::boot($root, $files));
+            } catch (RuntimeException $error) {
+                $this->bootFailure = $error->getMessage();
+
+                throw $error;
+            }
             profilePhase('wiring: boot', $started, ['deps' => count($this->wiring['deps'])]);
             $this->generation++;
             $this->recordBoot();
