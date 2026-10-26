@@ -172,21 +172,27 @@ impl FileWatcher {
 
     fn follow(&mut self, freshness: &Freshness) {
         let Some(watcher) = self.watcher.as_mut() else { return };
-        for directory in freshness.watched_directories() {
-            if self.watched.contains(&directory) {
-                continue;
-            }
-            match notify::Watcher::watch(watcher, &directory, notify::RecursiveMode::NonRecursive) {
-                Ok(()) => {
-                    self.watched.insert(directory);
-                }
-                Err(error) => {
-                    eprintln!("stopped watching files at {} ({error}); changes are picked up when queried", directory.display());
-                    self.watcher = None;
-                    return;
-                }
+        let added: Vec<PathBuf> = freshness.watched_directories().into_iter().filter(|directory| !self.watched.contains(directory)).collect();
+        if added.is_empty() {
+            return;
+        }
+        // Added together: macOS restarts its event stream with every watched directory on each change, so one
+        // directory at a time costs a large repository tens of seconds before the first question is taken.
+        let mut paths = notify::Watcher::paths_mut(watcher);
+        for directory in &added {
+            if let Err(error) = paths.add(directory, notify::RecursiveMode::NonRecursive) {
+                eprintln!("stopped watching files at {} ({error}); changes are picked up when queried", directory.display());
+                drop(paths);
+                self.watcher = None;
+                return;
             }
         }
+        if let Err(error) = paths.commit() {
+            eprintln!("stopped watching files ({error}); changes are picked up when queried");
+            self.watcher = None;
+            return;
+        }
+        self.watched.extend(added);
     }
 }
 
@@ -217,9 +223,12 @@ pub fn serve(drivers_directory: &Path, repo_root: &Path) -> Result<(), String> {
     eprintln!("server {} started for {}", std::process::id(), repo_root.display());
     let _ = fs::write(socket.with_extension("info"), format!("{} {}", std::process::id(), repo_root.display()));
     let listener = ipc::listen(&socket).map_err(|error| format!("cannot listen on {}: {error}", socket.display()))?;
+    let started = std::time::Instant::now();
     let mut pool = DriverPool::start(drivers_directory, repo_root)?;
+    crate::resources::profile_phase("start: drivers spawned", started);
     let mut freshness = Freshness::new(repo_root.to_path_buf());
     freshness.sweep();
+    crate::resources::profile_phase("start: first sweep", started);
 
     let last_activity = Arc::new(AtomicU64::new(now_seconds()));
     let watchdog_activity = Arc::clone(&last_activity);
@@ -246,7 +255,9 @@ pub fn serve(drivers_directory: &Path, repo_root: &Path) -> Result<(), String> {
         }
     });
     let mut watcher = FileWatcher::start(work);
+    crate::resources::profile_phase("start: watcher started", started);
     watcher.follow(&freshness);
+    crate::resources::profile_phase("start: watcher following", started);
 
     while let Ok(next) = inbox.recv() {
         match next {
