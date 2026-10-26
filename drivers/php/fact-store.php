@@ -927,6 +927,8 @@ final class FactStore implements BackgroundWork
             return;
         }
         $this->allExtracted = true;
+        // Every name is now answered from the facts: searches, and so the word index, are not needed any more.
+        $this->files->forgetWordIndex();
         $usage = getrusage(1);
         profilePhase('warm-up: done', $this->warmUpStarted, [
             'files' => count($this->fileFacts),

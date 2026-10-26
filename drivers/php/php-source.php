@@ -679,6 +679,12 @@ final class PhpFileCache
         return array_keys(array_filter($found));
     }
 
+    /** Frees the word index (tens of MB on a large repo) once no search needs it; a later search builds it again. */
+    public function forgetWordIndex(): void
+    {
+        [$this->wordIndex, $this->indexedFiles, $this->changedSinceIndex] = [null, [], []];
+    }
+
     private function buildWordIndex(): void
     {
         $started = microtime(true);
