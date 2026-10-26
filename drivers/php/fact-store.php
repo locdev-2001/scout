@@ -26,6 +26,19 @@ final class FactStore implements BackgroundWork
 
     private const WARM_UP_CLASSES_PER_JOB = 100;
 
+    /** More files than this changed since the facts were saved (another branch): reading everything is as quick. */
+    private const SAVED_CHANGES_LIMIT = 500;
+
+    /** Bumped whenever file facts change, so they are saved again once the server is idle. */
+    private int $factsVersion = 0;
+
+    private int $savedVersion = 0;
+
+    /** Saving forks and writes every file's facts: after edits, at most this often (a later start syncs the rest). */
+    private const SAVE_INTERVAL_SECONDS = 60;
+
+    private ?float $lastSave = null;
+
     /** @var list<string> files still to read in the background */
     private array $warmUpQueue = [];
 
@@ -120,7 +133,7 @@ final class FactStore implements BackgroundWork
 
     public function hasIdleWork(): bool
     {
-        return $this->pool->needsWorkers() || $this->recomputeQueue !== [];
+        return $this->pool->needsWorkers() || $this->saveDue() || $this->recomputeQueue !== [];
     }
 
     /**
@@ -131,6 +144,11 @@ final class FactStore implements BackgroundWork
     {
         if ($this->pool->needsWorkers()) {
             $this->pool->addOne();
+
+            return;
+        }
+        if ($this->saveDue()) {
+            $this->save();
 
             return;
         }
@@ -553,6 +571,7 @@ final class FactStore implements BackgroundWork
         }
         unset($this->fileFacts[$path]);
         $this->forgetOwner("file:{$path}");
+        $this->factsVersion++;
     }
 
     private function remember(string $owner, array $deps): void
@@ -626,6 +645,7 @@ final class FactStore implements BackgroundWork
             $this->descendants = null;
         }
         $this->remember("file:{$path}", $fileFacts['deps']);
+        $this->factsVersion++;
     }
 
     /** @param list<array> $sites `__construct` sites */
@@ -710,8 +730,114 @@ final class FactStore implements BackgroundWork
     public function startWarmUp(): void
     {
         $this->warmUpStarted = microtime(true);
-        $this->warmUpQueue = array_values(array_diff($this->files->phpFiles(), array_keys($this->fileFacts)));
+        $phpFiles = $this->files->phpFiles();
+        $this->restoreSaved($phpFiles);
+        $this->warmUpQueue = array_values(array_diff($phpFiles, array_keys($this->fileFacts)));
         $this->fillWarmUp();
+    }
+
+    /** Where this repository's file facts are saved between servers (beside the other drivers' saved facts). */
+    private function savedPath(): string
+    {
+        $cache = getenv('SCOUT_CACHE') ?: (getenv('HOME') ?: sys_get_temp_dir()).'/.cache/scout';
+
+        return $cache.'/'.substr(sha1($this->files->repoRoot), 0, 16).'/php-facts';
+    }
+
+    /** Saved facts hold only for the same driver code, PHP and Composer setup (autoloading, test paths). */
+    private function savedKey(): string
+    {
+        $root = $this->files->repoRoot;
+        $inputs = [PHP_VERSION, $root];
+        foreach ([...glob(__DIR__.'/*.php'), "{$root}/composer.json", ...self::RESTART_INPUTS, ...glob("{$root}/vendor/composer/autoload_*.php")] as $path) {
+            $absolute = str_starts_with($path, '/') ? $path : "{$root}/{$path}";
+            $inputs[] = $path.'='.FactExtraction::contentHash($absolute);
+        }
+
+        return hash('xxh128', implode("\n", $inputs));
+    }
+
+    /**
+     * Reads back the facts a previous server saved. Files changed, added or removed since then go through sync(),
+     * as edits made while a server runs do, so facts built on them are refreshed; the rest is not read again.
+     *
+     * @param  list<string>  $phpFiles
+     */
+    private function restoreSaved(array $phpFiles): void
+    {
+        $started = microtime(true);
+        $data = @file_get_contents($this->savedPath());
+        $saved = $data === false ? false : @unserialize((string) @gzdecode($data), ['allowed_classes' => false]);
+        if (! is_array($saved) || ($saved['key'] ?? null) !== $this->savedKey()) {
+            return;
+        }
+        $root = $this->files->repoRoot;
+        // Files outside the repo's PHP files that facts were built on (vendor code): any change there, read all again.
+        foreach ($saved['outside'] as $path => $hash) {
+            if (FactExtraction::contentHash("{$root}/{$path}") !== $hash) {
+                return;
+            }
+        }
+        $changed = array_values(array_diff($phpFiles, array_keys($saved['files'])));
+        foreach ($saved['files'] as $path => $facts) {
+            if (FactExtraction::contentHash("{$root}/{$path}") !== $facts['hash']) {
+                $changed[] = $path;
+            }
+        }
+        if (count($changed) > self::SAVED_CHANGES_LIMIT) {
+            return;
+        }
+        foreach ($saved['files'] as $path => $facts) {
+            $this->storeFile($path, $facts);
+        }
+        profilePhase('start: saved facts read', $started, ['files' => count($saved['files']), 'changed' => count($changed)]);
+        if ($changed !== []) {
+            $this->sync($changed);
+        }
+        $this->savedVersion = $this->factsVersion;
+    }
+
+    private function saveDue(): bool
+    {
+        return $this->allExtracted && $this->warmUpJobs === [] && $this->factsVersion !== $this->savedVersion
+            && ($this->lastSave === null || microtime(true) - $this->lastSave > self::SAVE_INTERVAL_SECONDS);
+    }
+
+    /** Writes every file's facts in a forked child, so a question arriving meanwhile is not kept waiting. */
+    private function save(): void
+    {
+        $root = $this->files->repoRoot;
+        $files = [];
+        $outside = [];
+        foreach ($this->fileFacts as $path => $facts) {
+            // Back to the form fileFacts() returns, which storeFile() reads.
+            $facts['sites'] = $facts['byName'] === [] ? [] : array_merge(...array_values($facts['byName']));
+            $facts['mentions'] = array_keys($facts['mentions']);
+            unset($facts['byName'], $facts['answerHash']);
+            $files[$path] = $facts;
+            foreach ($facts['deps'] as $dependency) {
+                if (! isset($this->fileFacts[$dependency]) && str_ends_with($dependency, '.php')) {
+                    $outside[$dependency] ??= FactExtraction::contentHash("{$root}/{$dependency}");
+                }
+            }
+        }
+        $path = $this->savedPath();
+        $key = $this->savedKey();
+        $job = ForkedWorker::startBackground(function () use ($path, $key, $files, $outside) {
+            $started = microtime(true);
+            @mkdir(dirname($path), 0777, true);
+            // A full disk only costs the next server a slower start.
+            if (@file_put_contents("{$path}.tmp", gzencode(serialize(['key' => $key, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
+                @rename("{$path}.tmp", $path);
+            }
+            profilePhase('saved facts written', $started, ['files' => count($files), 'bytes' => @filesize($path)]);
+
+            return true;
+        }, 'save facts');
+        $this->warmUpJobs[(int) $job[1]] = $job;
+        $this->warmUpChunks[(int) $job[1]] = ['save', [], $this->changeSerial];
+        $this->savedVersion = $this->factsVersion;
+        $this->lastSave = microtime(true);
     }
 
     public function streams(): array
@@ -728,6 +854,9 @@ final class FactStore implements BackgroundWork
         }
         [$kind, $chunk, $startSerial] = $this->warmUpChunks[$key];
         unset($this->warmUpJobs[$key], $this->warmUpChunks[$key]);
+        if ($kind === 'save') {
+            return;
+        }
         if ($kind === 'classes') {
             $this->storeWarmClasses($chunk, $facts, $startSerial);
             $this->fillWarmUp();
