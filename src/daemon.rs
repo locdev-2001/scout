@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const IDLE_SECONDS: u64 = 30 * 60;
+const IDLE_SECONDS: u64 = 10 * 60;
 const STARTUP_WAIT: Duration = Duration::from_secs(15);
 
 fn fnv1a(text: &str) -> u64 {

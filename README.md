@@ -86,7 +86,7 @@ Phần "Affected entry points" là những lối vào bị ảnh hưởng: route
 
 ## Vì sao nhanh mà vẫn đúng
 
-- Lần hỏi đầu, scout khởi động một tiến trình chạy nền cho dự án. Tiến trình này tự tắt sau 30 phút không ai hỏi.
+- Lần hỏi đầu, scout khởi động một tiến trình chạy nền cho dự án. Tiến trình này tự tắt sau 10 phút không ai hỏi để trả RAM (phiên sau Python/JS khởi động lại nhanh nhờ cache; PHP lớn mất vài giây, Rust lớn 15–40 giây).
 - Nó để ý file nào bạn vừa lưu và cập nhật ngay, nên lúc bạn hỏi thì phần lớn việc đã xong.
 - Mỗi lần hỏi, nó vẫn kiểm lại nhanh toàn bộ file để chắc không trả lời bằng dữ liệu cũ.
 - Mỗi ngôn ngữ dùng chính "bộ não" của ngôn ngữ đó để hiểu code:
