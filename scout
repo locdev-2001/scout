@@ -5,6 +5,11 @@ home="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 export CARGO_TARGET_DIR="$home/target"
 binary="$CARGO_TARGET_DIR/release/scout"
 if [[ ! -x "$binary" || -n "$(find "$home/src" "$home/Cargo.toml" -newer "$binary" -print -quit)" ]]; then
-  cargo build --release --quiet --manifest-path "$home/Cargo.toml" >&2
+  if [[ "${1:-}" == hook && -x "$binary" ]]; then
+    # A hook has a few seconds inside the agent's turn: it runs the binary there is, the build goes on behind it.
+    setsid cargo build --release --quiet --manifest-path "$home/Cargo.toml" </dev/null >/dev/null 2>&1 &
+  else
+    cargo build --release --quiet --manifest-path "$home/Cargo.toml" >&2
+  fi
 fi
 SCOUT_HOME="$home" exec "$binary" "$@"
