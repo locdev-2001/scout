@@ -16,7 +16,7 @@ fn tools() -> Value {
         {
             "name": "callers",
             "description": "Everything that calls the target, walked back to entry points (routes, commands, events) with no depth limit. \
-Use it before changing a function to see all code the change affects, and on a stack-trace line to see how it is reached. \
+Use it instead of grep/rg to find who calls a function, method or class: before changing one to see all code the change affects, and on a stack-trace line to see how it is reached. \
 Each line: caller symbol [kind, confidence] path:line#hash. Confidence: exact (proven), likely (through a parent type or magic), \
 unresolved (receiver type unknown: read it). Answers reflect the files on disk at the moment of the call.",
             "inputSchema": {
@@ -89,7 +89,9 @@ fn answer(message: &Value) -> Option<Value> {
         "initialize" => Ok(json!({
             "protocolVersion": message.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION),
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "scout", "version": env!("CARGO_PKG_VERSION") }
+            "serverInfo": { "name": "scout", "version": env!("CARGO_PKG_VERSION") },
+            // Shown to the agent even while the tools themselves are deferred behind a tool search.
+            "instructions": "scout answers \"who calls this code\": use its `callers` tool instead of grep/rg to find every caller of a function, method or class (it follows types, imports, inheritance and framework wiring, and lists calls it cannot type instead of dropping them), before changing, renaming or deleting one. `locate` names the function a stack-trace line is in."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools() })),

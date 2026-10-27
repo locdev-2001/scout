@@ -15,6 +15,33 @@ const INSTRUCTIONS: &str = "## scout: who calls this code
 - For a stack-trace line, `scout locate path:line` names the function it is in.
 - For \"who calls X\", prefer it to grep/rg: it follows types, imports, inheritance and framework wiring. Keep grep for text that is not a symbol.";
 
+/// The skill Claude Code lists in every session, so an agent finds the tool when the task calls for it.
+const SKILL: &str = include_str!("skill.md");
+
+fn skill_path(home: &Path) -> PathBuf {
+    home.join(".claude/skills/scout/SKILL.md")
+}
+
+/// Writes the skill (or takes it out). A `scout` skill this tool did not write is left alone.
+fn write_skill(home: &Path, remove: bool) -> Result<(), String> {
+    let path = skill_path(home);
+    let current = fs::read_to_string(&path).ok();
+    if current.as_deref().is_some_and(|text| !text.contains("# scout: who calls this code")) {
+        return Err(format!("{} is not this tool's", path.display()));
+    }
+    if remove {
+        return match current {
+            Some(_) => fs::remove_dir_all(path.parent().unwrap()).map_err(|error| error.to_string()),
+            None => Ok(()),
+        };
+    }
+    if current.as_deref() == Some(SKILL) {
+        return Ok(());
+    }
+    fs::create_dir_all(path.parent().unwrap()).map_err(|error| error.to_string())?;
+    fs::write(&path, SKILL).map_err(|error| error.to_string())
+}
+
 fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).ok_or_else(|| "no home directory".to_owned())
 }
@@ -98,12 +125,16 @@ pub fn setup(dry_run: bool) -> Result<u8, String> {
         }
     }
     if present("claude") {
-        step(dry_run, "register the MCP server with Claude Code", || {
+        // Loaded with the session rather than deferred behind a tool search: an agent that must first look a tool up
+        // reaches for grep instead.
+        step(dry_run, "register the MCP server with Claude Code (always loaded)", || {
             let _ = run_quietly("claude", &["mcp", "remove", "--scope", "user", "scout"]);
-            run_quietly("claude", &["mcp", "add", "--scope", "user", "scout", "--", &launcher_text, "mcp"])
+            let server = serde_json::json!({ "type": "stdio", "command": launcher_text, "args": ["mcp"], "alwaysLoad": true });
+            run_quietly("claude", &["mcp", "add-json", "--scope", "user", "scout", &server.to_string()])
         });
         step(dry_run, "add the hooks to Claude Code (~/.claude/settings.json)", || hook::configure("install", false).map(|_| ()));
         step(dry_run, "add the instructions to ~/.claude/CLAUDE.md", || write_instructions(&home.join(".claude/CLAUDE.md"), false));
+        step(dry_run, &format!("add the skill {}", skill_path(&home).display()), || write_skill(&home, false));
     }
     if present("codex") {
         step(dry_run, "register the MCP server with Codex", || {
@@ -129,6 +160,7 @@ pub fn uninstall(dry_run: bool) -> Result<u8, String> {
         step(dry_run, "unregister the MCP server from Claude Code", || run_quietly("claude", &["mcp", "remove", "--scope", "user", "scout"]));
         step(dry_run, "remove the hooks from Claude Code", || hook::configure("remove", false).map(|_| ()));
         step(dry_run, "remove the instructions from ~/.claude/CLAUDE.md", || write_instructions(&home.join(".claude/CLAUDE.md"), true));
+        step(dry_run, &format!("remove the skill {}", skill_path(&home).display()), || write_skill(&home, true));
     }
     if present("codex") {
         step(dry_run, "unregister the MCP server from Codex", || run_quietly("codex", &["mcp", "remove", "scout"]));
@@ -204,6 +236,14 @@ pub fn status() -> Result<u8, String> {
     let scopes = |found: Vec<&str>, yes: &str, no: &str| if found.is_empty() { no.to_owned() } else { format!("{yes} ({})", found.join(", ")) };
     println!("  Claude Code MCP:   {}", scopes(mcp_scopes, "registered", "not registered"));
     println!("  Claude Code hooks: {}", scopes(hook_scopes, "installed", "not installed"));
+    let skill = fs::read_to_string(skill_path(&home)).ok();
+    println!("  Claude Code skill: {}", match skill.as_deref() {
+        Some(text) if text == SKILL => "installed",
+        Some(_) => "out of date (run `scout setup`)",
+        None => "not installed",
+    });
+    let always_loaded = claude.as_ref().and_then(|config| config.pointer("/mcpServers/scout/alwaysLoad")).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    println!("  MCP tools loaded:  {}", if always_loaded { "with every session" } else { "on demand (deferred; `scout setup` loads them with every session)" });
     println!("  Codex MCP:         {}", if contains(home.join(".codex/config.toml"), "mcp_servers.scout") { "registered" } else { "not registered" });
     let cache = daemon::cache_directory();
     println!("Saved analysis:    {} MB in {}", folder_bytes(&cache) / 1_048_576, cache.display());
@@ -212,6 +252,13 @@ pub fn status() -> Result<u8, String> {
     for (pid, repo, _) in running {
         let memory = fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|text| text.lines().find(|line| line.starts_with("VmRSS:")).map(|line| line.split_whitespace().nth(1).unwrap_or("0").parse::<u64>().unwrap_or(0) / 1024));
         println!("  {pid:>8}  {repo}{}", memory.map(|megabytes| format!("  ({megabytes} MB server alone; drivers apart)")).unwrap_or_default());
+    }
+    let usage = crate::hook::usage_by_day(7);
+    if !usage.is_empty() {
+        println!("Hooks, last 7 days (UTC):");
+        for line in usage {
+            println!("  {line}");
+        }
     }
     let usage = crate::hook::usage_by_day(7);
     if !usage.is_empty() {
