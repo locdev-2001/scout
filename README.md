@@ -28,7 +28,9 @@ scout là một lệnh dòng lệnh kèm MCP server. Bạn đưa tên một hàm
 - Mỗi ngôn ngữ dùng chính bộ phân tích của ngôn ngữ đó (tokenizer PHP, parser TypeScript, `ast` của CPython, `rust-analyzer`), không đoán bằng regex.
 - Thà thừa còn hơn sót: chỗ nào không chắc vẫn được liệt kê, gắn `unresolved`, để bạn đọc tay.
 - Kết quả luôn khớp code hiện tại: file vừa lưu được cập nhật ngay, và mỗi lần hỏi đều kiểm lại để không trả lời bằng dữ liệu cũ.
-- Agent dùng được ngay: MCP server cho Claude Code và Codex, cùng hook để agent thấy người gọi ngay khi sửa hay grep một hàm.
+- Agent dùng được ngay: MCP server cho Claude Code và Codex, cùng hook để agent thấy người gọi ngay khi sửa hay grep một hàm, và được nhắc trước khi kết thúc lượt nếu còn hàm đã đổi mà chưa xem người gọi.
+
+scout không thay grep. Nó trả lời một câu: đổi chỗ này thì ảnh hưởng tới đâu. Tìm định nghĩa, chuỗi, khoá cấu hình, dòng log vẫn là việc của `grep`/`rg`.
 
 ## Ví dụ
 
@@ -81,7 +83,8 @@ Mỗi ngôn ngữ hiểu code bằng công cụ của chính nó:
 - [x] Laravel: scope, accessor, middleware, form request, policy, facade, `__call`, macro
 - [x] Monorepo pnpm, yarn, bun, npm workspace: import gói nội bộ được nối tới file nguồn qua `exports`/`types`/`main`
 - [x] Lời gọi ngầm của Python (`with`, `for`, `len(x)`, `__getattr__`...) và Rust (`?`, `Display`, `Iterator`, `Deref`...)
-- [x] MCP server (`callers`, `locate`) và hook cho Claude Code
+- [x] `scout locate file:dòng,dòng,…`: các hàm quanh nhiều dòng một lần
+- [x] MCP server (`callers`, `locate`) và hook cho Claude Code: người gọi của hàm vừa đổi dù đổi bằng cách nào, nhắc một lần cuối lượt
 - [x] Ngôn ngữ khác (C/C++, Java, C#, Go...): mọi chỗ gọi theo tên, gắn `unresolved`
 
 ## Cài đặt
@@ -96,7 +99,12 @@ Lệnh này build công cụ rồi chạy `scout setup`, làm trọn mọi bư�
 
 - tạo lệnh `scout` trong `~/.local/bin`;
 - gắn MCP server cho Claude Code và Codex (agent khác: thêm MCP server chạy `scout mcp`);
-- gắn ba hook cho Claude Code: phiên vừa mở thì tiến trình nền của repo bắt đầu đọc code; sửa một hàm xong, agent thấy ngay những chỗ gọi hàm đó; agent grep một tên hàm (kể cả trong `$( … )` hay nhiều lần tìm nối nhau), nó nhận thêm danh sách người gọi chính xác. Lệnh grep vẫn chạy như thường, hook chỉ thêm 15 ms ở trung vị và không bao giờ quá 1,5 giây; grep lọc output của lệnh khác hay tìm trong `.env`, `.md`, `.json` thì bị bỏ qua. Lần grep đầu tiên trong một repo chưa có tiến trình nền sẽ bật nó lên, nên có thể chưa kèm kết quả;
+- gắn hook cho Claude Code:
+  - phiên vừa mở: tiến trình nền của repo bắt đầu đọc code, và scout ghi lại commit gốc để biết phiên này đổi gì;
+  - sau mỗi lần agent đổi code, dù bằng `Edit`, `Write` hay một lệnh shell (`sed -i`, script Python): scout so file với commit gốc, tìm hàm quanh các dòng đổi và đưa ngay danh sách người gọi của hàm agent chưa xem. Lệnh shell không đổi file nào chỉ tốn một lần `git status`;
+  - trước khi agent kết thúc lượt (gồm cả thay đổi do subagent làm): nếu còn hàm đã đổi trong phiên mà agent chưa xem người gọi, scout đưa danh sách đó và agent đi tiếp một vòng để kiểm. Mỗi hàm chỉ được nhắc một lần, kể cả khi agent đã commit giữa chừng;
+  - agent grep một tên hàm (kể cả trong `$( … )` hay nhiều lần tìm nối nhau): nó nhận thêm danh sách người gọi chính xác. Lệnh grep vẫn chạy như thường, hook chỉ thêm 15 ms ở trung vị và không bao giờ quá 1,5 giây; grep lọc output của lệnh khác hay tìm trong `.env`, `.md`, `.json` thì bị bỏ qua. Lần grep đầu tiên trong một repo chưa có tiến trình nền sẽ bật nó lên, nên có thể chưa kèm kết quả;
+  - agent tự hỏi `callers` (MCP hay CLI) thì hàm đó được tính là đã xem;
 - thêm vài dòng hướng dẫn vào `~/.claude/CLAUDE.md` và `~/.codex/AGENTS.md`;
 - cài bộ đọc JavaScript dự phòng cho dự án không có `typescript` riêng;
 - báo máy có những gì để phân tích code (PHP, Node, Python, rust-analyzer).
@@ -116,7 +124,7 @@ scout uninstall       # gỡ mọi thứ setup đã thêm
 
 `scout stop` dừng cả các bộ phân tích tiến trình nền đã mở, kể cả `rust-analyzer` đang nạp dở.
 
-`scout status` còn báo RAM của từng tiến trình nền, số slot đang dùng, và theo từng ngày hook đã thêm được danh sách người gọi vào bao nhiêu phần trăm lần agent tìm kiếm (kèm lý do những lần không thêm). Có thể chỉnh bằng biến môi trường:
+`scout status` còn báo RAM của từng tiến trình nền, số slot đang dùng, và theo từng ngày: hook đã thêm được danh sách người gọi vào bao nhiêu phần trăm lần agent tìm kiếm hay đổi code, và ở bao nhiêu phần trăm lần kết thúc lượt agent đã xem người gọi của mọi hàm nó đổi (`finish … all-shown`), kèm lý do những lần không đạt. Có thể chỉnh bằng biến môi trường:
 
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
@@ -177,6 +185,7 @@ scout nói thẳng chỗ nó không chắc thay vì im lặng bỏ qua.
 
 - Code gọi hàm bằng tên lấy từ biến, kiểu `$obj->$tenHam()` hay `$tenClass::taoMoi()`, thì không công cụ nào đoán chắc được. Những chỗ này luôn được liệt kê `unresolved`.
 - Gọi qua một đối tượng không rõ từ đâu ra (`item.save()` khi `item` được truyền vào từ chỗ khác) thì tool chỉ biết theo tên, nên liệt kê `unresolved`. Với PHP, dòng như vậy chỉ được liệt kê ở file có nhắc tên class (nếu không, mọi `->save()` trong dự án sẽ hiện ra). Riêng kết quả của một hàm trong dự án (`const { save } = useCart()`, `const cart = useCart(); cart.add()`) thì tool lần theo được.
+- Hook theo dõi thay đổi chỉ thấy hàm còn trong code: hàm bị xoá hẳn hay đổi tên thì chỉ hàm bao quanh chỗ xoá được hỏi, người gọi của tên cũ phải hỏi tay. File mới (chưa có ở commit gốc của phiên) không được hỏi, vì trước phiên chưa ai gọi nó. Lệnh shell sửa file ở một repo khác thư mục làm việc chỉ được thấy khi phiên đã từng sửa repo đó bằng `Edit`/`Write`. Agent đụng vào một file đã sửa dở từ trước phiên thì cả thay đổi cũ trong file đó cũng được hỏi.
 - Import trỏ vào chính dự án mà không tìm ra file (đường dẫn sai, gói chưa build) thì các lời gọi qua nó vẫn được liệt kê `unresolved`, không bị bỏ.
 - Một câu hỏi rất rộng (không giới hạn `--depth` trên hàm dùng khắp nơi) dừng sau 10 giây, trả phần đã đi được và nói rõ chỗ bị cắt; hỏi tiếp về một người gọi trong đó để đi sâu hơn. Nếu bạn ngắt lệnh, tiến trình nền dừng câu đó ngay, không bắt câu sau phải chờ.
 - Nếu một bộ phân tích ngôn ngữ bị kẹt (không làm gì suốt 20 giây), scout khởi động lại nó và hỏi lại một lần. Vẫn kẹt thì câu trả lời có thêm cảnh báo ngôn ngữ đó chưa trả lời được, thay vì treo mãi.

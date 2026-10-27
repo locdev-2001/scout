@@ -1,6 +1,6 @@
 # Tài nguyên không tăng theo số worktree, và agent thật sự nhận được scout
 
-Trạng thái: **đã làm phase 0–6, còn mở** (27/10/2026). Kết quả và đối chiếu DoD: [`docs/reports/resources-and-adoption-261027.md`](../../reports/resources-and-adoption-261027.md). Còn mở: RAM ổn định khoảng 1,1–1,3 GB mỗi server nên ngưỡng 2,5 GB cho 5 server không đạt; ngân sách mặc định 40 % quá cao để có tác dụng; chưa kiểm MCP còn bị defer trong phiên mới; chưa chạy `uninstall`; số lần agent tự gọi phải đo lại sau 2–3 ngày.
+Trạng thái: **đã làm phase 0–6, còn mở** (27/10/2026). Kết quả và đối chiếu DoD: [`docs/reports/resources-and-adoption-261027.md`](../../reports/resources-and-adoption-261027.md). Còn mở: RAM ổn định khoảng 1,1–1,3 GB mỗi server nên ngưỡng 2,5 GB cho 5 server không đạt; ngân sách mặc định 40 % quá cao để có tác dụng; chưa kiểm MCP còn bị defer trong phiên mới; chưa chạy `uninstall`; số lần agent tự gọi phải đo lại sau 2–3 ngày (27/10: chỉ số này được thay bằng tỉ lệ `finish … all-shown`, xem [`261027-impact-at-change`](../261027-impact-at-change/plan.md)).
 
 ## Hai vấn đề
 
