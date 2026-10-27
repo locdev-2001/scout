@@ -1,4 +1,9 @@
-<h1 align="center">scout</h1>
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.png">
+    <img src="docs/brand/lockup-light.png" alt="scout" width="300">
+  </picture>
+</h1>
 
 <p align="center">
   <a href="https://github.com/locdev-2001/scout/stargazers"><img src="https://img.shields.io/github/stars/locdev-2001/scout?style=flat&logo=github" alt="GitHub stars"></a>
