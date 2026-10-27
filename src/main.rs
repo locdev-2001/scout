@@ -130,7 +130,7 @@ fn run(options: Options) -> Result<u8, String> {
         _ => {}
     }
     if options.command == "hook" {
-        return Ok(hook::run(&options.query));
+        return Ok(hook::run(&options.query, options.dry_run));
     }
     if options.command == "claude-hooks" {
         return hook::configure(&options.query, options.dry_run);

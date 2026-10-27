@@ -213,6 +213,13 @@ pub fn status() -> Result<u8, String> {
         let memory = fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|text| text.lines().find(|line| line.starts_with("VmRSS:")).map(|line| line.split_whitespace().nth(1).unwrap_or("0").parse::<u64>().unwrap_or(0) / 1024));
         println!("  {pid:>8}  {repo}{}", memory.map(|megabytes| format!("  ({megabytes} MB server alone; drivers apart)")).unwrap_or_default());
     }
+    let usage = crate::hook::usage_by_day(7);
+    if !usage.is_empty() {
+        println!("Hooks, last 7 days (UTC):");
+        for line in usage {
+            println!("  {line}");
+        }
+    }
     Ok(0)
 }
 
