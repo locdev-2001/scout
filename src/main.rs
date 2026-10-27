@@ -1,4 +1,5 @@
 mod cargo;
+mod changes;
 mod daemon;
 mod cli;
 mod driver;

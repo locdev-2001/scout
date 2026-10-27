@@ -526,11 +526,11 @@ impl DriverPool {
 
     /// Asks only the drivers that read files with this one's extension (all of them when none claims it): a
     /// driver of another language would answer with a file-level guess.
-    pub fn ask_about_file(&mut self, op: &str, args: Value, file: &str) -> Vec<Arc<Value>> {
+    pub fn ask_many_about_file(&mut self, op: &str, requests: &[Value], file: &str) -> Vec<Vec<Arc<Value>>> {
         let extension = Path::new(file).extension().map(|extension| extension.to_string_lossy().to_lowercase()).unwrap_or_default();
         let claimed: Vec<bool> = self.drivers.iter().map(|driver| driver.manifest.extensions.iter().any(|claimed| claimed.eq_ignore_ascii_case(&extension))).collect();
         if !claimed.contains(&true) {
-            return self.ask(op, args);
+            return self.ask_many(op, requests);
         }
         let others: Vec<Driver> = {
             let mut kept = Vec::new();
@@ -541,7 +541,7 @@ impl DriverPool {
             self.drivers = kept;
             others
         };
-        let answers = self.ask(op, args);
+        let answers = self.ask_many(op, requests);
         // Put every driver back in its original order.
         let mut kept = std::mem::take(&mut self.drivers).into_iter();
         let mut others = others.into_iter();

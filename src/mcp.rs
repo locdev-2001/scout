@@ -16,7 +16,7 @@ fn tools() -> Value {
         {
             "name": "callers",
             "description": "Everything that calls the target, walked back to entry points (routes, commands, events) with no depth limit. \
-Use it instead of grep/rg to find who calls a function, method or class: before changing one to see all code the change affects, and on a stack-trace line to see how it is reached. \
+Use it, rather than a text search, to find who calls a function, method or class: before changing one to see all code the change affects, and on a stack-trace line to see how it is reached. \
 Each line: caller symbol [kind, confidence] path:line#hash. Confidence: exact (proven), likely (through a parent type or magic), \
 unresolved (receiver type unknown: read it). Answers reflect the files on disk at the moment of the call.",
             "inputSchema": {
@@ -36,7 +36,7 @@ unresolved (receiver type unknown: read it). Answers reflect the files on disk a
             "description": "Which function or class a source line belongs to (for example a stack-trace frame), as a symbol usable with callers.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "position": { "type": "string", "description": "path:line" }, "repo": repo },
+                "properties": { "position": { "type": "string", "description": "path:line, or path:line,line,… for the symbols around several lines" }, "repo": repo },
                 "required": ["position"]
             }
         }
@@ -91,7 +91,7 @@ fn answer(message: &Value) -> Option<Value> {
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "scout", "version": env!("CARGO_PKG_VERSION") },
             // Shown to the agent even while the tools themselves are deferred behind a tool search.
-            "instructions": "scout answers \"who calls this code\": use its `callers` tool instead of grep/rg to find every caller of a function, method or class (it follows types, imports, inheritance and framework wiring, and lists calls it cannot type instead of dropping them), before changing, renaming or deleting one. `locate` names the function a stack-trace line is in."
+            "instructions": "scout answers \"what does changing this code affect\": its `callers` tool lists every caller of a function, method or class, walked back to the entry points (routes, commands, jobs, events). It follows types, imports, inheritance and framework wiring, and lists calls it cannot type instead of dropping them. Ask it before changing, renaming or deleting code. `locate` names the function a stack-trace line is in. It is not a text search: keep grep/rg for text, definitions, config and logs."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools() })),

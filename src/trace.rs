@@ -35,12 +35,14 @@ fn parse_all<T: serde::de::DeserializeOwned>(values: Vec<Arc<Value>>, pool: &mut
     parsed
 }
 
-/// `file:line` is located through the drivers, anything else is resolved as a symbol name.
-pub fn resolve_target(pool: &mut DriverPool, query: &str, position: Option<(String, u32)>) -> Vec<SymbolRef> {
+/// `file:line` (or `file:line,line,…`) is located through the drivers, each symbol around those lines once;
+/// anything else is resolved as a symbol name.
+pub fn resolve_target(pool: &mut DriverPool, query: &str, position: Option<(String, Vec<u32>)>) -> Vec<SymbolRef> {
     let mut targets: Vec<SymbolRef> = match position {
-        Some((file, line)) => {
-            let located = pool.ask_about_file("locate", json!({ "file": file, "line": line }), &file);
-            parse_all::<SymbolRef>(located, pool).into_iter().take(1).collect()
+        Some((file, lines)) => {
+            let requests: Vec<Value> = lines.iter().map(|line| json!({ "file": file, "line": line })).collect();
+            let located = pool.ask_many_about_file("locate", &requests, &file);
+            located.into_iter().flat_map(|answers| parse_all::<SymbolRef>(answers, pool).into_iter().take(1)).collect()
         }
         None => {
             let resolved: Vec<SymbolRef> = {
