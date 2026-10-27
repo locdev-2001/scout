@@ -1,16 +1,22 @@
 //! Claude Code hooks: what an agent should know about callers, given to it at the moment it matters, so it does
 //! not depend on the agent choosing this tool over a text search.
 //!
-//! `after-edit` (PostToolUse on Edit/MultiEdit): the direct callers of each function just edited.
+//! `after-change` (PostToolUse on Edit/MultiEdit/Write/Bash and the `callers` MCP tool): the direct callers of each
+//! function the call changed, however it changed the file (an edit, a written file, a script); a `callers` question
+//! the agent asked itself is noted.
+//! `finish` (Stop): before the agent ends its turn, the callers of every function changed in the session (by it or
+//! its subagents) that it has not been shown yet, once.
 //! `before-search` (PreToolUse on Grep/Bash): a text search for a function name also gets that function's callers.
 //! `session-start` (SessionStart): the server of the session's repository starts reading the code, so the first
-//! searches find it ready.
+//! searches find it ready, and the session's changes are measured from here.
 //!
-//! Hooks never block or slow the agent: the search still runs, a server not ready in time adds nothing, and any
-//! failure is silent.
+//! Hooks never block the agent: the search or edit still runs, a server not ready in time adds nothing, and any
+//! failure is silent. Only `finish` makes the agent go on, for one more round, and only when a changed function has
+//! callers it has not seen.
 
+use crate::changes::{holds_code, with_session, ChangedLines};
 use crate::daemon;
-use crate::query::QueryRequest;
+use crate::query::{QueryRequest, QueryResponse};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const BUDGET: Duration = Duration::from_secs(3);
 /// Before a text search the agent is waiting: only a quick answer is worth adding.
 const SEARCH_BUDGET: Duration = Duration::from_millis(1500);
+/// At the end of a turn the agent is done working: a longer wait buys the callers of everything it changed.
+const FINISH_BUDGET: Duration = Duration::from_secs(20);
 /// Words a search may start with that name no function.
 const KEYWORDS: [&str; 16] = ["function", "class", "def", "return", "public", "private", "protected", "static", "const", "import", "export", "async", "await", "interface", "trait", "struct"];
 /// Lines of answer one hook adds at most: enough for the direct callers, small enough for the context.
@@ -29,8 +37,11 @@ const MAX_LINES: usize = 40;
 /// Names asked about at most per search command: the server answers one question at a time, so each extra one can
 /// keep the next search waiting.
 const MAX_SEARCHED_NAMES: usize = 2;
-/// Edited places looked up at most per edit.
+/// Changed functions whose callers are added at most per tool call; the others wait for the end of the turn.
 const MAX_PLACES: usize = 3;
+/// At the end of a turn: changed functions asked about, and lines of answer added, at most.
+const MAX_REMINDED: usize = 12;
+const MAX_FINISH_LINES: usize = 150;
 
 /// What became of one hook run, kept in the hook log so its usefulness can be measured.
 #[derive(Clone, Copy, PartialEq)]
@@ -47,6 +58,12 @@ enum Outcome {
     Timeout,
     /// Answers came back but held nothing worth the context (nobody calls it, or only by name).
     NotUseful,
+    /// End of a turn: every changed function's callers had been shown before.
+    AllShown,
+    /// End of a turn: the callers of changed functions not shown before were added.
+    Reminded,
+    /// End of a turn: the files the session changed hold no changed function (new files only, changes undone).
+    NoChange,
 }
 
 impl Outcome {
@@ -58,6 +75,9 @@ impl Outcome {
             Outcome::NotRunning => "not-running",
             Outcome::Timeout => "timeout",
             Outcome::NotUseful => "not-useful",
+            Outcome::AllShown => "all-shown",
+            Outcome::Reminded => "reminded",
+            Outcome::NoChange => "no-change",
         }
     }
 }
@@ -70,7 +90,9 @@ pub fn run(event: &str, dry_run: bool) -> u8 {
     }
     let Ok(input) = serde_json::from_str::<Value>(&input) else { return 0 };
     let context = match event {
-        "after-edit" => after_edit(&input),
+        // `after-edit` is what an older setup installed.
+        "after-change" | "after-edit" => after_change(&input),
+        "finish" => finish(&input),
         "before-search" if dry_run => {
             let planned = planned_search(&input);
             let shown = match &planned {
@@ -86,57 +108,172 @@ pub fn run(event: &str, dry_run: bool) -> u8 {
         _ => None,
     };
     if let Some(context) = context {
-        let event_name = if event == "after-edit" { "PostToolUse" } else { "PreToolUse" };
+        let event_name = input.get("hook_event_name").and_then(Value::as_str).unwrap_or("PostToolUse");
         println!("{}", json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": context } }));
     }
     0
 }
 
-fn after_edit(input: &Value) -> Option<String> {
-    let tool_input = input.get("tool_input")?;
-    let file = PathBuf::from(tool_input.get("file_path")?.as_str()?);
-    if !holds_code(&file) {
-        return None;
-    }
-    let replacements: Vec<&str> = match tool_input.get("edits").and_then(Value::as_array) {
-        Some(edits) => edits.iter().filter_map(|edit| edit.get("new_string").and_then(Value::as_str)).collect(),
-        None => tool_input.get("new_string").and_then(Value::as_str).into_iter().collect(),
-    };
-    let content = std::fs::read_to_string(&file).ok()?;
-    let mut lines: Vec<usize> = replacements
-        .iter()
-        // Where the new text sits, when it sits in one place only: a text found twice could be either.
-        .filter(|text| !text.trim().is_empty() && content.matches(*text).count() == 1)
-        .filter_map(|text| content.find(*text).map(|offset| content[..offset].matches('\n').count() + 1))
-        .map(|line| declared_below(&content, line))
-        .collect();
-    lines.sort_unstable();
-    lines.dedup();
-    let repo = repo_root(file.parent()?)?;
-    let relative = file.strip_prefix(&repo).ok()?.to_string_lossy().into_owned();
-    let questions: Vec<String> = lines.into_iter().take(MAX_PLACES).map(|line| format!("{relative}:{line}")).collect();
-    if questions.is_empty() {
-        return None;
-    }
-    let started = Instant::now();
-    let answers = ask(&repo, questions.clone(), BUDGET, true);
-    record("after-edit", &repo, &questions, answers.as_ref().err().copied().unwrap_or(Outcome::Added), started);
-    Some(format!("scout: direct callers of the code just edited (check they still fit the change):\n{}", answers.ok()?))
-}
-
-/// A doc comment, attribute or blank line belongs to the declaration under it: that line is asked about instead.
-fn declared_below(content: &str, line: usize) -> usize {
-    let leading = |text: &str| {
-        let text = text.trim_start();
-        text.is_empty() || ["//", "/*", "*", "#", "@"].iter().any(|prefix| text.starts_with(prefix))
-    };
-    content.lines().enumerate().skip(line - 1).find(|(_, text)| !leading(text)).map_or(line, |(index, _)| index + 1)
+fn session_id(input: &Value) -> &str {
+    input.get("session_id").and_then(Value::as_str).unwrap_or_default()
 }
 
 fn session_start(input: &Value) -> Option<String> {
     let cwd = PathBuf::from(input.get("cwd")?.as_str()?);
-    let _ = daemon::ensure_running(&repo_root(&cwd)?);
+    let repo = repo_root(&cwd)?;
+    crate::changes::forget_old_sessions();
+    with_session(session_id(input), |session| session.follow(&repo));
+    let _ = daemon::ensure_running(&repo);
     None
+}
+
+/// The symbols a `callers` question names, when the tool call is one: the MCP tool, or `scout callers X` in a shell.
+fn asked_callers(tool: &str, tool_input: &Value) -> Vec<String> {
+    match tool {
+        "mcp__scout__callers" => tool_input.get("target").and_then(Value::as_str).map(str::to_owned).into_iter().collect(),
+        "Bash" => {
+            let words = shell_words(tool_input.get("command").and_then(Value::as_str).unwrap_or_default());
+            let asks = |index: usize| words[index] == "callers" && index > 0 && (words[index - 1] == "scout" || words[index - 1].ends_with("/scout"));
+            (0..words.len()).filter(|index| asks(*index)).filter_map(|index| words[index + 1..].iter().take_while(|word| !is_separator(word)).find(|word| !word.starts_with('-')).cloned()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// What the tool call changed in the code, found in the repositories rather than in the call: an edit, a written
+/// file and a shell script that rewrites one all count. The callers of the functions it changed that the agent has
+/// not been shown yet are added.
+fn after_change(input: &Value) -> Option<String> {
+    let tool = input.get("tool_name")?.as_str()?;
+    let tool_input = input.get("tool_input")?;
+    let cwd = PathBuf::from(input.get("cwd").and_then(Value::as_str).unwrap_or("."));
+    let asked = asked_callers(tool, tool_input);
+    let edited = tool_input.get("file_path").and_then(Value::as_str).map(|file| cwd.join(file));
+    let starting_points = [Some(cwd.as_path()), edited.as_deref().and_then(Path::parent)];
+    let repositories: Vec<PathBuf> = starting_points.into_iter().flatten().filter_map(repo_root).collect();
+    let id = session_id(input);
+    let changed = with_session(id, |session| {
+        session.mark_shown(asked.iter().map(String::as_str));
+        // A file edited the moment its repository starts being followed is already in the snapshot: count it here.
+        let mut edited_first = Vec::new();
+        for repo in &repositories {
+            let relative = edited.as_ref().and_then(|file| file.canonicalize().ok()?.strip_prefix(repo).ok().map(|file| file.to_string_lossy().into_owned()));
+            if session.follow(repo) {
+                if let Some(file) = relative.filter(|file| holds_code(Path::new(file))) {
+                    session.note_changed(repo, &file);
+                    edited_first.push((repo.clone(), file));
+                }
+            }
+        }
+        let mut changed = Vec::new();
+        for repo in session.repositories() {
+            let mut files = session.changes_since_last_look(&repo);
+            files.extend(edited_first.iter().filter(|(edited_repo, _)| *edited_repo == repo).map(|(_, file)| file.clone()));
+            changed.extend(session.changed_lines(&repo, &files));
+        }
+        changed
+    })?;
+    let started = Instant::now();
+    let deadline = started + BUDGET;
+    let mut added = Vec::new();
+    for (repo, places) in by_repository(changed) {
+        let symbols = match changed_symbols(&repo, places, deadline) {
+            Ok(symbols) => symbols,
+            Err(outcome) => {
+                record("after-change", &repo, &[], outcome, started);
+                continue;
+            }
+        };
+        let unshown: Vec<String> = with_session(id, |session| symbols.into_iter().filter(|symbol| !session.was_shown(symbol)).take(MAX_PLACES).collect()).unwrap_or_default();
+        if unshown.is_empty() {
+            continue;
+        }
+        let callers = ask(&repo, unshown.clone(), deadline, true);
+        with_session(id, |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
+        record("after-change", &repo, &unshown, callers.outcome(), started);
+        added.extend(callers.text(MAX_LINES));
+    }
+    (!added.is_empty()).then(|| format!("scout: direct callers of the code just changed (check they still fit the change):\n{}", added.join("\n")))
+}
+
+/// Before the agent ends its turn: the callers of every function the session changed that it was not shown yet,
+/// once. Asked again after this, the agent may stop.
+fn finish(input: &Value) -> Option<String> {
+    if input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let id = session_id(input);
+    let changed = with_session(id, |session| session.has_changes().then(|| session.repositories().iter().flat_map(|repo| session.all_changed_lines(repo)).collect::<Vec<_>>()))??;
+    let started = Instant::now();
+    let deadline = started + FINISH_BUDGET;
+    let mut reminders = Vec::new();
+    let mut not_fetched = Vec::new();
+    for (repo, places) in by_repository(changed) {
+        let symbols = match changed_symbols(&repo, places, deadline) {
+            Ok(symbols) => symbols,
+            Err(outcome) => {
+                record("finish", &repo, &[], outcome, started);
+                continue;
+            }
+        };
+        let unshown: Vec<String> = with_session(id, |session| symbols.iter().filter(|symbol| !session.was_shown(symbol)).cloned().collect()).unwrap_or_default();
+        if unshown.is_empty() {
+            record("finish", &repo, &[], if symbols.is_empty() { Outcome::NoChange } else { Outcome::AllShown }, started);
+            continue;
+        }
+        let callers = ask(&repo, unshown.iter().take(MAX_REMINDED).cloned().collect(), deadline, true);
+        let missed: Vec<String> = unshown.iter().filter(|symbol| !callers.answered.contains(symbol)).cloned().collect();
+        // Each changed function is brought up once: listed now, whether its callers came back in time or not.
+        with_session(id, |session| session.mark_shown(unshown.iter().map(String::as_str)));
+        let outcome = match callers.outcome() {
+            Outcome::Added => Outcome::Reminded,
+            _ if !missed.is_empty() => Outcome::Timeout,
+            other => other,
+        };
+        record("finish", &repo, &unshown, outcome, started);
+        reminders.extend(callers.text(MAX_FINISH_LINES));
+        not_fetched.extend(missed);
+    }
+    if reminders.is_empty() && not_fetched.is_empty() {
+        return None;
+    }
+    let mut text = "scout: functions changed in this session whose callers you have not looked at yet. Before finishing, check each caller still fits the change (read the `unresolved` lines too):".to_owned();
+    for reminder in reminders {
+        text.push('\n');
+        text.push_str(&reminder);
+    }
+    if !not_fetched.is_empty() {
+        text.push_str(&format!("\nAlso changed, callers not fetched in time (run `scout callers <symbol> --compact`): {}", not_fetched.join(", ")));
+    }
+    Some(text)
+}
+
+fn by_repository(changed: Vec<ChangedLines>) -> std::collections::BTreeMap<PathBuf, Vec<ChangedLines>> {
+    let mut grouped: std::collections::BTreeMap<PathBuf, Vec<ChangedLines>> = Default::default();
+    for lines in changed {
+        grouped.entry(lines.repo.clone()).or_default().push(lines);
+    }
+    grouped
+}
+
+/// The functions (and classes) around changed lines, each once; a change outside any (an import, a file-level
+/// statement) names none.
+fn changed_symbols(repo: &Path, places: Vec<ChangedLines>, deadline: Instant) -> Result<Vec<String>, Outcome> {
+    let files: Vec<String> = places.iter().map(|place| place.file.clone()).collect();
+    let questions = places.into_iter().map(|place| format!("{}:{}", place.file, place.lines.iter().map(u32::to_string).collect::<Vec<_>>().join(","))).collect();
+    let replies = replies_within(repo, "locate", questions, deadline, true);
+    if replies.answered.is_empty() {
+        return Err(if replies.timed_out { Outcome::Timeout } else { Outcome::NotRunning });
+    }
+    let mut symbols: Vec<String> = Vec::new();
+    for (_, response) in replies.answered {
+        for symbol in response.stdout.lines().filter_map(|line| line.split("  ").next()).filter(|symbol| !symbol.is_empty() && !files.iter().any(|file| file == symbol)) {
+            if !symbols.iter().any(|known| known == symbol) {
+                symbols.push(symbol.to_owned());
+            }
+        }
+    }
+    Ok(symbols)
 }
 
 /// The function names one search command looks for, all in one repository.
@@ -190,9 +327,14 @@ fn before_search(input: &Value) -> Option<String> {
     };
     // A search in a repository whose server is not running starts it: this search goes on alone, the next ones
     // get answers. Waiting here would make a text search wait for a whole repository to be read.
-    let answers = daemon::ensure_running(&repo).map_err(|_| Outcome::NotRunning).and_then(|()| ask(&repo, names.clone(), SEARCH_BUDGET, false));
-    record("before-search", &repo, &names, answers.as_ref().err().copied().unwrap_or(Outcome::Added), started);
-    let answers = answers.ok()?;
+    if daemon::ensure_running(&repo).is_err() {
+        record("before-search", &repo, &names, Outcome::NotRunning, started);
+        return None;
+    }
+    let callers = ask(&repo, names.clone(), started + SEARCH_BUDGET, false);
+    record("before-search", &repo, &names, callers.outcome(), started);
+    with_session(session_id(input), |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
+    let answers = callers.text(MAX_LINES)?;
     let listed = names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
     Some(format!("scout: who calls {listed} (exact, with entry points; unresolved lines are listed for reading, never dropped). For callers, `scout callers` answers more completely than a text search:\n{answers}"))
 }
@@ -270,13 +412,6 @@ fn expanded(text: &str, variables: &std::collections::HashMap<String, String>) -
         result = format!("{}{}{}", &result[..start], value(name)?, &result[start + 1 + length..]);
     }
     Some(result)
-}
-
-/// Whether a file searched by name can hold calls: settings, notes, data and logs cannot.
-fn holds_code(file: &Path) -> bool {
-    let name = file.file_name().map(|name| name.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let extension = file.extension().map(|extension| extension.to_string_lossy().to_lowercase()).unwrap_or_default();
-    !name.starts_with(".env") && !["md", "txt", "json", "yml", "yaml", "toml", "ini", "log", "csv", "lock", "xml", "sql", "neon"].contains(&extension.as_str())
 }
 
 fn is_separator(word: &str) -> bool {
@@ -375,58 +510,86 @@ fn repo_root(start: &Path) -> Option<PathBuf> {
     start.ancestors().find(|place| place.exists())?.canonicalize().ok()?.ancestors().find(|directory| directory.join(".git").exists()).map(Path::to_path_buf)
 }
 
-/// Direct callers of each question, all within one time budget; the outcome when nothing useful came back in time.
+/// What one server answered to questions asked in turn, those that came back before the deadline.
+struct Replies {
+    answered: Vec<(String, QueryResponse)>,
+    timed_out: bool,
+}
+
 /// `start` lets the question start a server for the repository (it keeps reading the code for the next one).
-fn ask(repo: &Path, questions: Vec<String>, budget: Duration, start: bool) -> Result<String, Outcome> {
-    let (sender, answers) = mpsc::channel();
+fn replies_within(repo: &Path, command: &str, questions: Vec<String>, deadline: Instant, start: bool) -> Replies {
+    let (sender, replies) = mpsc::channel();
     let repo = repo.to_path_buf();
+    let command = command.to_owned();
     thread::spawn(move || {
         for question in questions {
-            let request = QueryRequest { command: "callers".to_owned(), query: question, cwd: repo.clone(), max_depth: 1, max_nodes: usize::MAX, include_tests: false, compact: true };
+            let request = QueryRequest { command: command.clone(), query: question.clone(), cwd: repo.clone(), max_depth: 1, max_nodes: usize::MAX, include_tests: false, compact: true };
             let answer = if start { daemon::query(&repo, &request) } else { daemon::query_running(&repo, &request) };
-            if sender.send(answer).is_err() {
+            if sender.send((question, answer)).is_err() {
                 return;
             }
         }
     });
-    let mut text = Vec::new();
-    let (mut answered, mut timed_out) = (false, false);
-    let deadline = Instant::now() + budget;
+    let mut answered = Vec::new();
     loop {
-        let answer = match answers.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(answer) => answer,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                timed_out = true;
-                break;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        let Ok(response) = answer else { continue };
-        answered = true;
+        match replies.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((question, Ok(response))) => answered.push((question, response)),
+            Ok((_, Err(_))) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return Replies { answered, timed_out: true },
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Replies { answered, timed_out: false },
+        }
+    }
+}
+
+/// Direct callers worth adding to the agent's context, and which questions the server answered in time.
+struct Callers {
+    lines: Vec<String>,
+    answered: Vec<String>,
+    timed_out: bool,
+}
+
+impl Callers {
+    /// What became of the questions when nothing useful came back in time.
+    fn outcome(&self) -> Outcome {
+        if !self.lines.is_empty() {
+            Outcome::Added
+        } else if self.timed_out {
+            Outcome::Timeout
+        } else if !self.answered.is_empty() {
+            Outcome::NotUseful
+        } else {
+            Outcome::NotRunning
+        }
+    }
+
+    fn text(&self, max_lines: usize) -> Option<String> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        let mut text: Vec<String> = self.lines.iter().take(max_lines).cloned().collect();
+        if self.lines.len() > max_lines {
+            text.push(format!("… {} more lines: run `scout callers` for the full list", self.lines.len() - max_lines));
+        }
+        Some(text.join("\n"))
+    }
+}
+
+/// Direct callers of each question, all before one deadline.
+fn ask(repo: &Path, questions: Vec<String>, deadline: Instant, start: bool) -> Callers {
+    let replies = replies_within(repo, "callers", questions, deadline, start);
+    let mut callers = Callers { lines: Vec::new(), answered: Vec::new(), timed_out: replies.timed_out };
+    for (question, response) in replies.answered {
+        callers.answered.push(question);
         // A file-level symbol, one nobody calls, or calls found by name alone (what the search itself prints)
         // add nothing worth the context. A name may stand for several symbols, each with its own total.
         let mut totals = response.stdout.lines().filter(|line| line.starts_with("Total:")).peekable();
         let by_name_only = totals.peek().is_some() && totals.all(|line| line.starts_with("Total: 0 exact, 0 likely"));
         let useful = response.exit_code == 0 && !by_name_only && response.stdout.lines().any(|line| line.starts_with("- ")) && !response.stdout.contains("(file)");
         if useful {
-            text.extend(response.stdout.lines().filter(|line| !line.trim().is_empty()).map(str::to_owned));
+            callers.lines.extend(response.stdout.lines().filter(|line| !line.trim().is_empty()).map(str::to_owned));
         }
     }
-    if text.is_empty() {
-        return Err(if timed_out {
-            Outcome::Timeout
-        } else if answered {
-            Outcome::NotUseful
-        } else {
-            Outcome::NotRunning
-        });
-    }
-    if text.len() > MAX_LINES {
-        let more = text.len() - MAX_LINES;
-        text.truncate(MAX_LINES);
-        text.push(format!("… {more} more lines: run `scout callers` for the full list"));
-    }
-    Ok(text.join("\n"))
+    callers
 }
 
 /// Where each hook run is logged, one JSON line each: kept with the saved analysis so it survives a restart.
@@ -478,10 +641,12 @@ pub fn usage_by_day(days: u64) -> Vec<String> {
         .iter()
         .rev()
         .map(|((day, event), outcomes)| {
+            // At the end of a turn the aim is that nothing is left to show: every changed function's callers seen.
+            let aim = if event == "finish" { "all-shown" } else { "added" };
             let runs: u64 = outcomes.values().sum();
-            let added = outcomes.get("added").copied().unwrap_or_default();
-            let others = outcomes.iter().filter(|(outcome, _)| *outcome != "added").map(|(outcome, count)| format!("{outcome} {count}")).collect::<Vec<_>>().join(", ");
-            format!("{}  {event:<13} {runs:>5} runs, {:>3}% added{}", civil_date(*day), added * 100 / runs.max(1), if others.is_empty() { String::new() } else { format!("  ({others})") })
+            let reached = outcomes.get(aim).copied().unwrap_or_default();
+            let others = outcomes.iter().filter(|(outcome, _)| *outcome != aim).map(|(outcome, count)| format!("{outcome} {count}")).collect::<Vec<_>>().join(", ");
+            format!("{}  {event:<13} {runs:>5} runs, {:>3}% {aim}{}", civil_date(*day), reached * 100 / runs.max(1), if others.is_empty() { String::new() } else { format!("  ({others})") })
         })
         .collect()
 }
@@ -502,8 +667,19 @@ fn civil_date(days: u64) -> String {
 
 /// Hook entries this tool owns in Claude Code's settings, recognized by their command.
 fn owned(entry: &Value) -> bool {
-    entry.get("hooks").and_then(Value::as_array).into_iter().flatten().any(|hook| hook.get("command").and_then(Value::as_str).is_some_and(|command| command.contains(" hook after-edit") || command.contains(" hook before-search") || command.contains(" hook session-start")))
+    let modes = [" hook after-edit", " hook after-change", " hook finish", " hook before-search", " hook session-start"];
+    entry.get("hooks").and_then(Value::as_array).into_iter().flatten().any(|hook| hook.get("command").and_then(Value::as_str).is_some_and(|command| modes.iter().any(|mode| command.contains(mode))))
 }
+
+/// Each hook: its event, the tools it runs for (none: every time), its mode, and its time limit in seconds.
+/// No `SubagentStop`: a subagent's hooks carry its parent's session, so a reminder there would be marked shown and
+/// never reach the agent that reports to the user; the parent's `Stop` covers the subagent's changes too.
+const HOOKS: [(&str, &str, &str, u64); 4] = [
+    ("PreToolUse", "Grep|Bash", "before-search", 10),
+    ("PostToolUse", "Edit|MultiEdit|Write|Bash|mcp__scout__callers", "after-change", 10),
+    ("SessionStart", "startup|resume", "session-start", 10),
+    ("Stop", "", "finish", 30),
+];
 
 /// Adds (or with `remove`, takes out) this tool's hooks in `settings`, leaving every other hook as it was.
 /// Returns the new settings, or None when nothing changes.
@@ -513,14 +689,21 @@ pub fn configured(settings: &Value, binary: &str, remove: bool) -> Option<Value>
         updated = json!({});
     }
     let hooks = updated.as_object_mut()?.entry("hooks").or_insert_with(|| json!({}));
-    let wanted = [("PreToolUse", "Grep|Bash", "before-search"), ("PostToolUse", "Edit|MultiEdit", "after-edit"), ("SessionStart", "startup|resume", "session-start")];
-    for (event, matcher, mode) in wanted {
-        let entries = hooks.as_object_mut()?.entry(event).or_insert_with(|| json!([])).as_array_mut()?;
+    // This tool's entries go first, under every event: one an older setup used may no longer be wanted.
+    for entries in hooks.as_object_mut()?.values_mut().filter_map(Value::as_array_mut) {
         entries.retain(|entry| !owned(entry));
+    }
+    for (event, matcher, mode, timeout) in HOOKS {
+        let entries = hooks.as_object_mut()?.entry(event).or_insert_with(|| json!([])).as_array_mut()?;
         if !remove {
-            entries.push(json!({ "matcher": matcher, "hooks": [{ "type": "command", "command": format!("{binary} hook {mode}"), "timeout": 10 }] }));
+            let mut entry = json!({ "hooks": [{ "type": "command", "command": format!("{binary} hook {mode}"), "timeout": timeout }] });
+            if !matcher.is_empty() {
+                entry["matcher"] = json!(matcher);
+            }
+            entries.push(entry);
         }
     }
+    hooks.as_object_mut()?.retain(|_, entries| entries.as_array().is_none_or(|entries| !entries.is_empty()));
     (updated != *settings).then_some(updated)
 }
 

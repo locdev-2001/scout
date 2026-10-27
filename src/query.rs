@@ -32,14 +32,14 @@ pub struct QueryResponse {
     pub answered_ms: u64,
 }
 
-/// `file:line` → (path relative to the repo root, line); anything else is a symbol query.
-fn parse_position(query: &str, repo_root: &Path, cwd: &Path) -> Option<(String, u32)> {
-    let (file, line) = query.rsplit_once(':')?;
-    let line = line.parse().ok()?;
+/// `file:line` or `file:line,line,…` → (path relative to the repo root, lines); anything else is a symbol query.
+fn parse_position(query: &str, repo_root: &Path, cwd: &Path) -> Option<(String, Vec<u32>)> {
+    let (file, lines) = query.rsplit_once(':')?;
+    let lines = lines.split(',').map(|line| line.trim().parse().ok()).collect::<Option<Vec<u32>>>()?;
     let candidates = [cwd.join(file), repo_root.join(file)];
     let absolute = candidates.iter().find(|path| path.is_file())?.canonicalize().ok()?;
     let relative = absolute.strip_prefix(repo_root).ok()?;
-    Some((relative.to_string_lossy().into_owned(), line))
+    Some((relative.to_string_lossy().into_owned(), lines))
 }
 
 /// Tells every driver which files changed since the previous query. The answers (extra inputs to watch,
@@ -88,6 +88,7 @@ pub fn execute(pool: &mut DriverPool, freshness: &mut Freshness, repo_root: &Pat
     let synchronizing = start_synchronize(pool, freshness);
     let mut source = SourceLines::new(repo_root.to_path_buf());
     let position = parse_position(&request.query, repo_root, &request.cwd);
+    let locates_lines = request.command == "locate" && position.is_some();
     let started = Instant::now();
     let targets = resolve_target(pool, &request.query, position);
     profile_phase("resolve", started);
@@ -120,6 +121,12 @@ pub fn execute(pool: &mut DriverPool, freshness: &mut Freshness, repo_root: &Pat
                 let _ = writeln!(out, "{body}\n\n{}", render_summary(&trace));
             }
             profile_phase("render", started);
+        }
+        // Several lines, several symbols around them: each one, as asked.
+        many if locates_lines => {
+            for target in many {
+                let _ = writeln!(out, "{}", describe_ref(target, &mut source));
+            }
         }
         // A bare name defined a few times (`save` in two classes): the callers of each, as a text search
         // would show every use; more than that, the list to choose from.
@@ -159,7 +166,7 @@ pub fn execute(pool: &mut DriverPool, freshness: &mut Freshness, repo_root: &Pat
         }
     }
     let _ = writeln!(response.stderr, "{}", cost.finish(pool.process_ids()));
-    let answered = targets.len() == 1 || (request.command == "callers" && (2..=SEVERAL).contains(&targets.len()));
+    let answered = targets.len() == 1 || (locates_lines && !targets.is_empty()) || (request.command == "callers" && (2..=SEVERAL).contains(&targets.len()));
     response.exit_code = if answered && !not_found { 0 } else { 1 };
     response.answered_ms = cost.elapsed_ms();
     response

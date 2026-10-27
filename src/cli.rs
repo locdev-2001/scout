@@ -9,11 +9,12 @@ use std::process::Command;
 /// What agents are told about this tool, in their global instructions, between these markers.
 const BEGIN: &str = "<!-- scout: begin -->";
 const END: &str = "<!-- scout: end -->";
-const INSTRUCTIONS: &str = "## scout: who calls this code
+const INSTRUCTIONS: &str = "## scout: who calls this code, what a change affects
 
-- Before changing a function, method or class, run `scout callers <Class::method | name | path:line> --compact` (MCP tool `callers`): every caller and entry point (route, command, job, event). Read the `unresolved` lines too: they are calls the tool could not type, listed so none is missed.
+- scout answers one question: what calls this function, method or class, up to the entry points (routes, commands, jobs, events). It follows types, imports, inheritance and framework wiring. It is not a text search: find text, definitions, config keys and log lines with grep/rg as usual.
+- Before changing, renaming or deleting a function, method or class, run `scout callers <Class::method | name | path:line> --compact` (MCP tool `callers`). Read the `unresolved` lines too: they are calls the tool could not type, listed so none is missed.
 - For a stack-trace line, `scout locate path:line` names the function it is in.
-- For \"who calls X\", prefer it to grep/rg: it follows types, imports, inheritance and framework wiring. Keep grep for text that is not a symbol.";
+- After you change code (any way: edit, write, script), the hooks add the callers of each function changed; at the end of a turn they list changed functions whose callers you have not seen yet. Check each caller still fits the change.";
 
 /// The skill Claude Code lists in every session, so an agent finds the tool when the task calls for it.
 const SKILL: &str = include_str!("skill.md");
@@ -204,18 +205,18 @@ pub fn status() -> Result<u8, String> {
             mcp_scopes.push("project .mcp.json");
         }
     }
-    let mut hook_scopes = Vec::new();
-    if contains(home.join(".claude/settings.json"), " hook after-edit") {
-        hook_scopes.push("user");
-    }
-    for settings in [".claude/settings.json", ".claude/settings.local.json"] {
-        if repo.as_ref().is_some_and(|repo| contains(repo.join(settings), " hook after-edit")) {
-            hook_scopes.push(settings);
+    // Every setup installed the search hook; only the current one installs the end-of-turn hook.
+    let (mut hook_scopes, mut current_hooks) = (Vec::new(), true);
+    let settings_files = [("user", home.join(".claude/settings.json"))].into_iter().chain(repo.iter().flat_map(|repo| [".claude/settings.json", ".claude/settings.local.json"].map(|settings| (settings, repo.join(settings)))));
+    for (scope, settings) in settings_files {
+        if contains(settings.clone(), " hook before-search") {
+            hook_scopes.push(scope);
+            current_hooks &= contains(settings, " hook finish");
         }
     }
     let scopes = |found: Vec<&str>, yes: &str, no: &str| if found.is_empty() { no.to_owned() } else { format!("{yes} ({})", found.join(", ")) };
     println!("  Claude Code MCP:   {}", scopes(mcp_scopes, "registered", "not registered"));
-    println!("  Claude Code hooks: {}", scopes(hook_scopes, "installed", "not installed"));
+    println!("  Claude Code hooks: {}", scopes(hook_scopes, if current_hooks { "installed" } else { "out of date, run `scout setup`" }, "not installed"));
     let skill = fs::read_to_string(skill_path(&home)).ok();
     println!("  Claude Code skill: {}", match skill.as_deref() {
         Some(text) if text == SKILL => "installed",

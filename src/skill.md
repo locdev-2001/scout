@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Find every caller of a function, method or class, walked back to its entry points (routes, commands, jobs, events), from the code on disk now. Use before changing a signature, renaming, deleting or changing the behavior of a function; when reading a stack trace; and whenever the question is "who calls X" or "what does changing X affect". Prefer it to grep/rg for callers.
+description: Find what a change affects - every caller of a function, method or class, walked back to its entry points (routes, commands, jobs, events), from the code on disk now. Use before changing a signature, renaming, deleting or changing the behavior of a function; when reading a stack trace; and whenever the question is "who calls X" or "what does changing X affect". Not a text search - keep grep/rg for text, definitions, config and logs.
 allowed-tools: Bash(scout callers:*), Bash(scout locate:*)
 ---
 
@@ -33,6 +33,13 @@ scout locate app/Services/OrderService.php:120               # which function a 
   change.
 - The first question in a repository may take some seconds while its code is read; later ones take milliseconds.
 
+## While you change code
+
+The hooks add the direct callers of each function you change, whatever changed it (an edit, a written file, a
+script), and at the end of a turn they list the changed functions whose callers you have not seen yet. Check that
+each caller still fits the change before finishing.
+
 ## When not to use it
 
-Text that is not a symbol (a message, a config key, a CSS class) is a job for grep.
+scout does not replace grep. Finding where something is defined, a message, a config key, a CSS class or a log line
+is a job for grep/rg.
