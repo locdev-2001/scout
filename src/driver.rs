@@ -95,6 +95,19 @@ fn append_tail(tail: &Mutex<String>, text: &str) {
     }
 }
 
+/// The other checkouts of this repository (git worktrees sharing its history), one path per line: a driver may start
+/// from the analysis one of them saved instead of reading every file again.
+fn sibling_checkouts(repo_root: &Path) -> String {
+    let Ok(output) = Command::new("git").arg("-C").arg(repo_root).args(["worktree", "list", "--porcelain"]).output() else { return String::new() };
+    let own = repo_root.canonicalize().unwrap_or_else(|_| repo_root.to_path_buf());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .filter(|path| Path::new(path).canonicalize().is_ok_and(|path| path != own))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl Driver {
     fn spawn(name: String, directory: PathBuf, manifest: DriverManifest, repo_root: PathBuf, claimed_extensions: String) -> Result<Self, String> {
         let (program, args) = manifest.command.split_first().ok_or(format!("{name}: driver.json has no command"))?;
@@ -107,6 +120,7 @@ impl Driver {
             .env("SCOUT_CLAIMED_EXTENSIONS", &claimed_extensions)
             .env("SCOUT_CACHE", crate::daemon::cache_directory())
             .envs(crate::slots::driver_environment())
+            .env("SCOUT_SEED_REPOS", sibling_checkouts(&repo_root))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

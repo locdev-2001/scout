@@ -761,24 +761,79 @@ final class FactStore implements BackgroundWork
     }
 
     /** Where this repository's file facts are saved between servers (beside the other drivers' saved facts). */
-    private function savedPath(): string
+    private function savedPath(?string $repoRoot = null): string
     {
         $cache = getenv('SCOUT_CACHE') ?: (getenv('HOME') ?: sys_get_temp_dir()).'/.cache/scout';
 
-        return $cache.'/'.substr(sha1($this->files->repoRoot), 0, 16).'/php-facts';
+        return $cache.'/'.substr(sha1($repoRoot ?? $this->files->repoRoot), 0, 16).'/php-facts';
     }
 
     /** Saved facts hold only for the same driver code, PHP and Composer setup (autoloading, test paths). */
     private function savedKey(): string
     {
+        return $this->inputsKey(['composer.json', ...self::RESTART_INPUTS, ...$this->relativeGlob('vendor/composer/autoload_*.php')]);
+    }
+
+    /**
+     * What facts saved by another checkout of the same repository (a git worktree) must share to be a starting point
+     * here: driver code, PHP and the installed packages. Composer's generated autoload files are left out: they list
+     * the application's own classes, which differ between branches, and every file that differs goes through
+     * sync() anyway.
+     */
+    private function seedKey(): string
+    {
+        return $this->inputsKey(['composer.json', 'composer.lock', ...self::RESTART_INPUTS]);
+    }
+
+    /** @param list<string> $repoFiles paths relative to the repository root */
+    private function inputsKey(array $repoFiles): string
+    {
         $root = $this->files->repoRoot;
-        $inputs = [PHP_VERSION, $root];
-        foreach ([...glob(__DIR__.'/*.php'), "{$root}/composer.json", ...self::RESTART_INPUTS, ...glob("{$root}/vendor/composer/autoload_*.php")] as $path) {
-            $absolute = str_starts_with($path, '/') ? $path : "{$root}/{$path}";
-            $inputs[] = $path.'='.FactExtraction::contentHash($absolute);
+        $inputs = [PHP_VERSION];
+        foreach (glob(__DIR__.'/*.php') as $driverFile) {
+            $inputs[] = basename($driverFile).'='.FactExtraction::contentHash($driverFile);
+        }
+        foreach ($repoFiles as $path) {
+            $inputs[] = $path.'='.FactExtraction::contentHash("{$root}/{$path}");
         }
 
         return hash('xxh128', implode("\n", $inputs));
+    }
+
+    /** @return list<string> */
+    private function relativeGlob(string $pattern): array
+    {
+        $root = $this->files->repoRoot;
+
+        return array_map(fn (string $path) => substr($path, strlen($root) + 1), glob("{$root}/{$pattern}") ?: []);
+    }
+
+    /**
+     * Facts another checkout of this repository saved, when this one has none of its own: the newest that was saved
+     * for this driver, PHP and installed packages, among the checkouts the core names (`SCOUT_SEED_REPOS`, one path
+     * per line). An older checkout's facts may still match when a newer one's were saved by another driver version.
+     */
+    private function seedFacts(): array|false
+    {
+        $candidates = [];
+        foreach (array_filter(explode("\n", (string) getenv('SCOUT_SEED_REPOS'))) as $sibling) {
+            $path = $this->savedPath($sibling);
+            $modified = @filemtime($path);
+            if ($modified !== false) {
+                $candidates[$path] = $modified;
+            }
+        }
+        arsort($candidates);
+        $wanted = $this->seedKey();
+        foreach (array_keys($candidates) as $path) {
+            $data = @file_get_contents($path);
+            $saved = $data === false ? false : @unserialize((string) @gzdecode($data), ['allowed_classes' => false]);
+            if (is_array($saved) && ($saved['seedKey'] ?? null) === $wanted) {
+                return $saved;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -791,19 +846,33 @@ final class FactStore implements BackgroundWork
     {
         $started = microtime(true);
         $data = @file_get_contents($this->savedPath());
-        $saved = $data === false ? false : @unserialize((string) @gzdecode($data), ['allowed_classes' => false]);
-        if (! is_array($saved) || ($saved['key'] ?? null) !== $this->savedKey()) {
+        $seeded = $data === false;
+        $saved = $seeded ? $this->seedFacts() : @unserialize((string) @gzdecode($data), ['allowed_classes' => false]);
+        $unused = fn (string $reason) => profilePhase('start: saved facts not used', $started, ['reason' => $reason, 'seeded' => $seeded]);
+        if (! is_array($saved)) {
+            return;
+        }
+        if (! $seeded && ($saved['key'] ?? null) !== $this->savedKey()) {
+            $unused('saved for another driver, PHP or Composer setup');
+
             return;
         }
         $root = $this->files->repoRoot;
         // A saved file no longer among the repo's PHP files (ignored since, for example) would keep facts a fresh
-        // start does not read: read all again.
-        if (array_diff_key($saved['files'], array_flip($phpFiles)) !== []) {
-            return;
+        // start does not read: read all again. One that another checkout has and this one lacks on disk is a
+        // deletion, which sync() handles below like any other.
+        foreach (array_keys(array_diff_key($saved['files'], array_flip($phpFiles))) as $path) {
+            if (! $seeded || file_exists("{$root}/{$path}")) {
+                $unused("{$path} is no longer among the PHP files");
+
+                return;
+            }
         }
         // Files outside the repo's PHP files that facts were built on (vendor code): any change there, read all again.
         foreach ($saved['outside'] as $path => $hash) {
             if (FactExtraction::contentHash("{$root}/{$path}") !== $hash) {
+                $unused("{$path} changed");
+
                 return;
             }
         }
@@ -815,14 +884,17 @@ final class FactStore implements BackgroundWork
             }
         }
         if (count($changed) > self::SAVED_CHANGES_LIMIT) {
+            $unused(count($changed).' files changed');
+
             return;
         }
         foreach ($saved['files'] as $path => $facts) {
             $this->storeFile($path, $facts);
         }
-        profilePhase('start: saved facts read', $started, ['files' => count($saved['files']), 'changed' => count($changed)]);
-        // What sync() changes is saved again once the server is idle.
-        $this->savedVersion = $this->factsVersion;
+        profilePhase($seeded ? 'start: facts of another checkout read' : 'start: saved facts read', $started, ['files' => count($saved['files']), 'changed' => count($changed)]);
+        // What sync() changes is saved again once the server is idle; facts taken from another checkout are saved
+        // as this one's own.
+        $this->savedVersion = $seeded ? -1 : $this->factsVersion;
         if ($changed !== []) {
             $this->sync($changed);
         }
@@ -844,7 +916,8 @@ final class FactStore implements BackgroundWork
         $stored = $this->fileFacts;
         $path = $this->savedPath();
         $key = $this->savedKey();
-        $job = ForkedWorker::startBackground(function () use ($root, $stored, $path, $key) {
+        $seedKey = $this->seedKey();
+        $job = ForkedWorker::startBackground(function () use ($root, $stored, $path, $key, $seedKey) {
             $started = microtime(true);
             $files = [];
             $outside = [];
@@ -862,7 +935,7 @@ final class FactStore implements BackgroundWork
             }
             @mkdir(dirname($path), 0777, true);
             // A full disk only costs the next server a slower start.
-            if (@file_put_contents("{$path}.tmp", gzencode(serialize(['key' => $key, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
+            if (@file_put_contents("{$path}.tmp", gzencode(serialize(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
                 @rename("{$path}.tmp", $path);
             }
             profilePhase('saved facts written', $started, ['files' => count($files), 'bytes' => @filesize($path)]);
