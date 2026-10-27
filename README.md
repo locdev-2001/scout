@@ -1,14 +1,14 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.png">
-    <img src="docs/brand/lockup-light.png" alt="scout" width="300">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.svg">
+    <img src="docs/brand/lockup-light.svg" alt="scout" width="300">
   </picture>
 </h1>
 
 <p align="center">
   <a href="https://github.com/locdev-2001/scout/stargazers"><img src="https://img.shields.io/github/stars/locdev-2001/scout?style=flat&logo=github" alt="GitHub stars"></a>
   <img src="https://img.shields.io/badge/Built%20with-Rust-000000?logo=rust&logoColor=white" alt="Built with Rust">
-  <img src="https://img.shields.io/badge/MCP-Claude%20Code%20%C2%B7%20Codex-D97757" alt="MCP: Claude Code, Codex">
+  <img src="https://img.shields.io/badge/MCP-Claude%20Code%20%C2%B7%20Codex-C8F03C" alt="MCP: Claude Code, Codex">
   <img src="https://img.shields.io/badge/PHP%20%C2%B7%20Laravel%20%C2%B7%20JS%2FTS%20%C2%B7%20Vue%20%C2%B7%20Python%20%C2%B7%20Rust-555555" alt="PHP, Laravel, JS/TS, Vue, Python, Rust">
 </p>
 

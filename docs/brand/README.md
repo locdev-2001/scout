@@ -17,7 +17,8 @@ Mark là con kiến nhìn từ trên, bò chéo lên: ba đốt nằm trên mộ
 | `mark-lime.svg` | Mark màu nhấn trên nền tối |
 | `icon.svg`, `icon-512.png` | Icon ứng dụng, avatar |
 | `favicon.ico` | Favicon 16, 32, 48 px (bản nét dày cho cỡ nhỏ) |
-| `lockup-light.png`, `lockup-dark.png` | Mark cùng chữ, nền sáng và nền tối |
+| `lockup-light.svg`, `lockup-dark.svg` | Mark cùng chữ, nền sáng và nền tối (chữ đã chuyển thành nét, không cần font) |
+| `lockup-light.png`, `lockup-dark.png` | Bản PNG của lockup, cho nơi không nhận SVG |
 
 ## Màu
 
