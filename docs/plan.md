@@ -388,3 +388,17 @@ Khoảng 136–200 lệnh có tìm một cái tên; phần không được trả
 RAM: phát lại bật 6 server (3 bản backend: repo chính + 2 worktree), RAM trống giảm khoảng 4,3–5 GB lúc cao nhất; tự tắt sau 10 phút rảnh.
 
 Còn mở (RAM): driver Laravel để sót tiến trình con ~330 MB còn đọc stdin của driver (có thể là nguyên nhân driver Laravel thỉnh thoảng kẹt); driver PHP giữ model token của nhiều file (~630 MB trên backend).
+
+## Scout là công cụ phân tích tác động, hook theo thay đổi thật (27/10/2026)
+
+Phân loại 1.402 lệnh grep của agent (25–27/10): chỉ khoảng 12–25 % là câu "ai gọi X"; còn lại là tìm định nghĩa, chuỗi, key, lọc output, log. Scout **không thay grep**: README, MCP `instructions`, skill và khối `CLAUDE.md` nói rõ scout trả lời "đổi chỗ này ảnh hưởng tới đâu", grep giữ việc tìm văn bản.
+
+Phiên refactor duy nhất sau khi cài skill/MCP sửa code khoảng 105 lần, 72 % bằng `Write` hoặc Bash (`python3 - <<EOF`, `sed -i`), nên hook `after-edit` (chỉ `Edit|MultiEdit`) không thấy. Thiết kế mới dựa vào chính repo:
+
+- Mỗi phiên có một bản ghi `~/.cache/scout/sessions/<id>.json`: commit gốc của từng repo, dấu vân tay file code chưa commit, file phiên đã đổi, symbol agent đã thấy người gọi.
+- `after-change` (`PostToolUse` trên `Edit|MultiEdit|Write|Bash|mcp__scout__callers`): file nào đổi dấu vân tay thì `git diff -U0 <gốc>`, một câu `locate file:dòng,dòng,…` lấy hàm quanh các dòng đổi, hỏi người gọi của tối đa 3 hàm chưa thấy.
+- `finish` (`Stop`): diff mọi file phiên đã đổi so với commit gốc (commit giữa lượt không che mất gì), hàm nào chưa thấy người gọi thì đưa vào phiên bằng `additionalContext`, một lần (`stop_hook_active`). Không gắn `SubagentStop`: hook của subagent mang `session_id` của phiên cha, nhắc ở đó sẽ đánh dấu đã xem mà agent chính không thấy.
+- `locate` nhận nhiều dòng một lần: lõi hỏi driver một lượt (`ask_many_about_file`), trung tính với ngôn ngữ.
+- Wrapper `scout` không bắt hook chờ `cargo build` khi mã nguồn mới hơn binary: hook chạy binary hiện có, build chạy nền. Trước đó, sửa mã nguồn scout làm mọi hook của các phiên khác chờ build và bị huỷ sau 10 s.
+
+Số đo và giới hạn: [`docs/reports/impact-at-change-261027.md`](reports/impact-at-change-261027.md).
