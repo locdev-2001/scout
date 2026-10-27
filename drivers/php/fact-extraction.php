@@ -500,6 +500,7 @@ final class FactExtraction
                 $file,
                 (int) $method->getStartLine(),
                 $this->scopeSymbolAt($file, (int) $method->getStartLine(), $method->getName()),
+                $method->isAbstract(),
             ];
         }
         $units = $this->concreteUnits(["class:{$reflection->getName()}" => true]);

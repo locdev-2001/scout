@@ -1281,6 +1281,8 @@ final class FactStore implements BackgroundWork
         $isConstructor = $name === '__construct';
         $targetDeclared = $this->methodOf($target, $name);
         $targetDeclaring = $targetDeclared === null ? strtolower($target['name']) : self::methodSource($targetDeclared);
+        // An abstract or interface method has no body of its own: a call to any implementation goes through it.
+        $targetAbstract = ! empty($targetDeclared[5]);
 
         $family = [$target['name'], ...$this->subclasses($target['name'])];
         $searchNames = $family;
@@ -1355,7 +1357,7 @@ final class FactStore implements BackgroundWork
             $stored = $kind === 'stored callable';
             $best = null;
             foreach ($types as $type) {
-                $match = $this->matchType($type, $target, $name, $isConstructor, $targetDeclaring, $kind === 'static');
+                $match = $this->matchType($type, $target, $name, $isConstructor, $targetDeclaring, $kind === 'static', $targetAbstract);
                 if ($match === 'exact') {
                     $best = 'exact';
                     break;
@@ -1482,8 +1484,11 @@ final class FactStore implements BackgroundWork
         return strtolower($declared[4] ?? "{$declared[0]}::{$declared[1]}");
     }
 
-    /** @param bool $fixed a call that names its class (`parent::m()`): it never reaches an override in a subclass */
-    private function matchType(string $type, array $target, string $method, bool $isConstructor, string $targetDeclaring, bool $fixed = false): ?string
+    /**
+     * @param bool $fixed a call that names its class (`parent::m()`): it never reaches an override in a subclass
+     * @param bool $abstract the target method has no body, so every implementation of it in the family counts
+     */
+    private function matchType(string $type, array $target, string $method, bool $isConstructor, string $targetDeclaring, bool $fixed = false, bool $abstract = false): ?string
     {
         $facts = $this->classFacts[strtolower(ltrim($type, '\\'))] ?? null;
         if ($facts === null) {
@@ -1500,7 +1505,7 @@ final class FactStore implements BackgroundWork
                 return $facts['magic'] ? 'likely' : null;
             }
 
-            return self::methodSource($declared) === $targetDeclaring ? 'exact' : null;
+            return $abstract || self::methodSource($declared) === $targetDeclaring ? 'exact' : null;
         }
         // In a trait, `self::m()` runs as the class using it: any class of the target's family may be that one.
         if ((! $fixed || ! empty($facts['trait'])) && ! $isConstructor && isset($target['ancestorKeys'][$typeKey]) && $this->methodOf($facts, $method) !== null) {
