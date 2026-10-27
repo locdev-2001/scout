@@ -53,6 +53,8 @@ scout callers X ──► tiến trình nền của dự án ──► driver th
 - Tiến trình nền để ý file nào bạn vừa lưu và cập nhật ngay, nên lúc bạn hỏi thì phần lớn việc đã xong. Mỗi lần hỏi nó vẫn kiểm lại nhanh toàn bộ file.
 - Hỏi lại lần hai gần như tức thì: câu trả lời được giữ tới khi file liên quan đổi.
 - Python, JavaScript/TypeScript và PHP lưu kết quả đọc file vào `~/.cache/scout` (vài MB đến vài chục MB mỗi dự án). Lần hỏi đầu của phiên sau từ 11–15 giây còn khoảng 1 giây trên dự án 6.000–8.000 file; backend Laravel 5.000 file từ khoảng 90 giây còn khoảng 10 giây. File đổi trong lúc tiến trình nền tắt vẫn được đọc lại. `scout status` báo dung lượng, `scout uninstall` xoá nó.
+- Git worktree mới của một dự án PHP đã có cache: scout lấy kết quả đọc của worktree anh em mới nhất làm điểm xuất phát, rồi chỉ đọc lại những file khác. Backend Laravel 5.000 file: CPU warm-up từ khoảng 29 giây còn 1–5 giây, kết quả giống hệt khi đọc từ đầu.
+- Nhiều dự án cùng khởi động không giành hết máy. Việc đọc cả dự án lúc khởi động chờ một trong các "slot" chung của máy (mặc định nửa số nhân), và không chạy khi RAM trống dưới 1,5 GB. Khi tổng RAM của mọi tiến trình nền vượt ngân sách (mặc định 40 % RAM máy), tiến trình lâu không được hỏi nhất bị tắt. Tiến trình đang trả lời hay vừa được hỏi trong 1 phút thì không bao giờ bị tắt.
 
 Mỗi ngôn ngữ hiểu code bằng công cụ của chính nó:
 
@@ -108,6 +110,16 @@ scout uninstall       # gỡ mọi thứ setup đã thêm
 ```
 
 `scout stop` dừng cả các bộ phân tích tiến trình nền đã mở, kể cả `rust-analyzer` đang nạp dở.
+
+`scout status` còn báo RAM của từng tiến trình nền, số slot đang dùng, và theo từng ngày hook đã thêm được danh sách người gọi vào bao nhiêu phần trăm lần agent tìm kiếm (kèm lý do những lần không thêm). Có thể chỉnh bằng biến môi trường:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `SCOUT_MAX_WORKERS` | nửa số nhân | số việc đọc dự án chạy cùng lúc trên cả máy; `0` = không giới hạn |
+| `SCOUT_MIN_AVAILABLE_MB` | `1536` | RAM trống tối thiểu để bắt đầu một việc đọc |
+| `SCOUT_MEMORY_BUDGET` | 40 % RAM máy (MB) | trần RAM của mọi tiến trình nền cộng lại; `0` = không giới hạn |
+
+`scout setup` còn cài skill `scout` cho Claude Code (`~/.claude/skills/scout/SKILL.md`) và đăng ký MCP với `alwaysLoad`, để tool `callers` được nạp cùng phiên thay vì nằm trong danh sách phải tìm mới dùng được.
 
 ## Cách hỏi
 
