@@ -2045,9 +2045,29 @@ class FactStore {
 }
 
 /** A warm-up reader: reads the files it is given and prints their facts, one JSON line each. */
+/**
+ * Waits for one of the machine-wide work slots (`scout hold-slot`), so repositories reading their code at once share
+ * the machine. The helper keeps the slot until this process ends and its stdin closes; nothing to wait for when the
+ * core hands out no slots.
+ */
+async function takeWorkSlot() {
+  const helper = process.env.SCOUT_SLOT_HELPER;
+  if (!helper) return;
+  const holder = spawn(helper, ['hold-slot'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  await new Promise((resolve) => {
+    holder.on('error', resolve);
+    holder.on('exit', resolve);
+    createInterface({ input: holder.stdout }).once('line', resolve);
+  });
+  holder.stdout.destroy();
+  holder.stdin.unref?.();
+  holder.unref();
+}
+
 async function serveReader() {
   let raw = '';
   for await (const chunk of process.stdin) raw += chunk;
+  await takeWorkSlot();
   const input = JSON.parse(raw);
   resolution = compileResolution(input.resolution);
   known = new Set(input.known);

@@ -11,6 +11,7 @@ mod mcp;
 mod output;
 mod query;
 mod resources;
+mod slots;
 mod trace;
 mod types;
 
@@ -40,6 +41,9 @@ const USAGE: &str = "Usage:
   scout --version
   scout hook after-edit|before-search|session-start  Claude Code hook (reads the hook's JSON on stdin)
   scout claude-hooks install|remove        add or remove those hooks in ~/.claude/settings.json
+  scout hold-slot                          for drivers: wait for a machine-wide work slot, hold it until stdin closes
+                                               (SCOUT_MAX_WORKERS slots, default half the cores, 0 = no limit;
+                                               none while less than SCOUT_MIN_AVAILABLE_MB of memory, default 1536)
     --dry-run       print the settings it would write
   --repo DIR        repository to inspect (default: the one containing the current directory)";
 
@@ -77,7 +81,7 @@ fn parse_options(args: Vec<String>) -> Result<Options, String> {
             options.query = repo.clone();
             Ok(options)
         }
-        [command] if ["mcp", "doctor", "setup", "uninstall", "status", "stop", "logs", "update", "--version"].contains(&command.as_str()) => {
+        [command] if ["mcp", "doctor", "setup", "uninstall", "status", "stop", "logs", "update", "hold-slot", "--version"].contains(&command.as_str()) => {
             options.command = command.clone();
             Ok(options)
         }
@@ -127,6 +131,7 @@ fn run(options: Options) -> Result<u8, String> {
         "stop" => return cli::stop(argument, options.dry_run),
         "logs" => return cli::logs(argument),
         "update" => return cli::update(),
+        "hold-slot" => return Ok(slots::hold()),
         _ => {}
     }
     if options.command == "hook" {

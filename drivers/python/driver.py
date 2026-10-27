@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pickle
+import select
 import subprocess
 import sys
 import tomllib
@@ -610,14 +611,42 @@ class Reader(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+SLOT_WAIT_SECONDS = 10
+
+
+def take_work_slot():
+    """One of the machine-wide work slots (`scout hold-slot`), so repositories reading their code at once share the
+    machine: the helper process while it is held (close its stdin to free the slot), None when the core hands out
+    none. False after SLOT_WAIT_SECONDS without one: a question may be waiting on this work, and the files are then
+    read in the driver itself."""
+    helper = os.environ.get("SCOUT_SLOT_HELPER")
+    if not helper:
+        return None
+    process = subprocess.Popen([helper, "hold-slot"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    ready, _, _ = select.select([process.stdout], [], [], SLOT_WAIT_SECONDS)
+    if ready and process.stdout.readline():
+        return process
+    process.kill()
+    process.wait()
+    return False
+
+
 def read_files(paths, known):
     """Warm-up worker, at the lowest priority: the facts of these files, imports resolved against `known`."""
     try:
         os.nice(19)
     except (AttributeError, OSError):
         pass  # lowering priority is a courtesy some systems refuse
-    modules = Modules(known)
-    return [(path, Store.parse_file(path, modules)) for path in paths]
+    slot = take_work_slot()
+    if slot is False:
+        return []
+    try:
+        modules = Modules(known)
+        return [(path, Store.parse_file(path, modules)) for path in paths]
+    finally:
+        if slot:
+            slot.stdin.close()
+            slot.wait()
 
 
 class Store:

@@ -76,11 +76,14 @@ final class ForkedWorker
      *
      * @return array{0: int, 1: resource, 2: string}
      */
-    public static function startBackground(callable $work, string $label = 'background', bool $lowPriority = true): array
+    public static function startBackground(callable $work, string $label = 'background', bool $lowPriority = true, bool $takesSlot = false): array
     {
-        [$pid, $stream] = self::start(function () use ($work, $lowPriority) {
+        [$pid, $stream] = self::start(function () use ($work, $lowPriority, $takesSlot) {
             if ($lowPriority && ! self::inline() && function_exists('proc_nice')) {
                 proc_nice(19);
+            }
+            if ($takesSlot && ! self::inline()) {
+                WorkSlot::take();
             }
 
             return $work();
@@ -246,6 +249,32 @@ final class ForkedWorker
         }
 
         return $payload['result'];
+    }
+}
+
+/**
+ * One of the machine-wide work slots the core hands out (`scout hold-slot`), so repositories reading their code at
+ * the same moment share the machine. Taken by a forked child before heavy work; held until that child ends, when the
+ * helper sees its stdin close and the slot is free again.
+ */
+final class WorkSlot
+{
+    /** @var array{0: resource, 1: array<int, resource>}|null */
+    private static ?array $held = null;
+
+    /** Waits for a slot; returns at once when the core hands out none (slots turned off, or no helper). */
+    public static function take(): void
+    {
+        $helper = getenv('SCOUT_SLOT_HELPER');
+        if (self::$held !== null || $helper === false || $helper === '') {
+            return;
+        }
+        $process = proc_open([$helper, 'hold-slot'], [0 => ['pipe', 'r'], 1 => ['pipe', 'w']], $pipes);
+        if (! is_resource($process)) {
+            return;
+        }
+        fgets($pipes[1]);
+        self::$held = [$process, $pipes];
     }
 }
 

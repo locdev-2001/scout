@@ -184,7 +184,7 @@ final class LaravelWiring implements BackgroundWork
                 ini_set('opcache.enable', '0');
 
                 return array_map(fn (string $class) => self::describeTraits($class, $files), $chunk);
-            }, 'warm-up traits');
+            }, 'warm-up traits', takesSlot: true);
             $this->traitJobs[(int) $job[1]] = [...$job, $chunk, $this->changedSoFar];
         }
     }

@@ -946,6 +946,9 @@ final class FactStore implements BackgroundWork
         $workers = $this->warmUpUrgent ? max(self::WARM_UP_WORKERS, 2 * $this->parallelism) : self::WARM_UP_WORKERS;
         while (count($this->warmUpJobs) < $workers && ($this->warmUpQueue !== [] || $this->warmUpSingles !== [])) {
             $chunk = $this->warmUpSingles !== [] ? [array_shift($this->warmUpSingles)] : array_splice($this->warmUpQueue, 0, self::WARM_UP_FILES_PER_JOB);
+            // While a question waits, one worker always runs without a machine-wide slot: the question moves on even
+            // when other repositories hold every slot (and the core, seeing work done, does not take it for a hang).
+            $free = $this->warmUpUrgent && ! in_array(true, array_column($this->warmUpChunks, 3), true);
             $job = ForkedWorker::startBackground(function () use ($root, $chunk) {
                 // The warm-up compiles most of the repo once; keep OPcache's shared memory for query workers.
                 ini_set('opcache.enable', '0');
@@ -956,9 +959,9 @@ final class FactStore implements BackgroundWork
                 }
 
                 return $facts;
-            }, 'warm-up files', ! $this->warmUpUrgent);
+            }, 'warm-up files', ! $this->warmUpUrgent, ! $free);
             $this->warmUpJobs[(int) $job[1]] = $job;
-            $this->warmUpChunks[(int) $job[1]] = ['files', $chunk, $this->changeSerial];
+            $this->warmUpChunks[(int) $job[1]] = ['files', $chunk, $this->changeSerial, $free];
         }
         if ($this->allExtracted) {
             $this->fillClassWarmUp();
@@ -1021,7 +1024,7 @@ final class FactStore implements BackgroundWork
                 $extraction = new FactExtraction(new PhpFileCache($root));
 
                 return array_map(fn (string $class) => $extraction->classFacts($class), $chunk);
-            }, 'warm-up classes');
+            }, 'warm-up classes', takesSlot: true);
             $this->warmUpJobs[(int) $job[1]] = $job;
             $this->warmUpChunks[(int) $job[1]] = ['classes', $chunk, $this->changeSerial];
         }

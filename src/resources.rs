@@ -41,6 +41,13 @@ fn memory_kb(pid: u32) -> u64 {
     field("smaps_rollup", "Pss:").or_else(|| field("status", "VmRSS:")).unwrap_or(0)
 }
 
+/// A line of `/proc/meminfo` in MB (`MemTotal`, `MemAvailable`); None where the system does not report it.
+pub fn system_memory_mb(field: &str) -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|line| line.split(':').next() == Some(field))?;
+    line.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kilobytes| kilobytes / 1024)
+}
+
 /// The processes and every live process they started (a language server, warm-up readers, forked workers).
 fn with_descendants(roots: Vec<u32>) -> Vec<u32> {
     let mut all = Vec::new();

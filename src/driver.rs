@@ -106,6 +106,7 @@ impl Driver {
             .current_dir(&directory)
             .env("SCOUT_CLAIMED_EXTENSIONS", &claimed_extensions)
             .env("SCOUT_CACHE", crate::daemon::cache_directory())
+            .envs(crate::slots::driver_environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
