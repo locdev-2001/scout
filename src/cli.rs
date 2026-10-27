@@ -173,32 +173,12 @@ pub fn uninstall(dry_run: bool) -> Result<u8, String> {
     Ok(0)
 }
 
-/// Running servers: (pid, repository, log file), read from what each server wrote when it started.
-fn servers() -> Vec<(u32, String, PathBuf)> {
-    let Ok(entries) = fs::read_dir(daemon::runtime_directory()) else { return Vec::new() };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "info"))
-        .filter_map(|path| {
-            let text = fs::read_to_string(&path).ok()?;
-            let (pid, repo) = text.trim().split_once(' ')?;
-            let pid: u32 = pid.parse().ok()?;
-            alive(pid).then(|| (pid, repo.to_owned(), path.with_extension("log")))
-        })
-        .collect()
-}
-
 fn folder_bytes(folder: &Path) -> u64 {
     fs::read_dir(folder).into_iter().flatten().filter_map(Result::ok).map(|entry| match entry.file_type() {
         Ok(kind) if kind.is_dir() => folder_bytes(&entry.path()),
         Ok(_) => entry.metadata().map(|metadata| metadata.len()).unwrap_or(0),
         Err(_) => 0,
     }).sum()
-}
-
-fn alive(pid: u32) -> bool {
-    Command::new("kill").args(["-0", &pid.to_string()]).output().is_ok_and(|output| output.status.success())
 }
 
 /// `scout status`: where it is installed and which servers run, with their memory.
@@ -247,11 +227,14 @@ pub fn status() -> Result<u8, String> {
     println!("  Codex MCP:         {}", if contains(home.join(".codex/config.toml"), "mcp_servers.scout") { "registered" } else { "not registered" });
     let cache = daemon::cache_directory();
     println!("Saved analysis:    {} MB in {}", folder_bytes(&cache) / 1_048_576, cache.display());
-    let running = servers();
-    println!("Servers running: {}", running.len());
-    for (pid, repo, _) in running {
-        let memory = fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|text| text.lines().find(|line| line.starts_with("VmRSS:")).map(|line| line.split_whitespace().nth(1).unwrap_or("0").parse::<u64>().unwrap_or(0) / 1024));
-        println!("  {pid:>8}  {repo}{}", memory.map(|megabytes| format!("  ({megabytes} MB server alone; drivers apart)")).unwrap_or_default());
+    let running = daemon::running_servers();
+    let spent: Vec<u64> = running.iter().map(|server| crate::resources::tree_memory_mb(server.pid)).collect();
+    println!("Servers running: {} ({} MB with their drivers; budget {})", running.len(), spent.iter().sum::<u64>(), match daemon::memory_budget_mb() {
+        0 => "none".to_owned(),
+        budget => format!("{budget} MB"),
+    });
+    for (server, memory) in running.iter().zip(spent) {
+        println!("  {:>8}  {}  ({memory} MB)", server.pid, server.repo);
     }
     let (busy, slots) = crate::slots::usage();
     if slots > 0 {
@@ -270,17 +253,9 @@ pub fn status() -> Result<u8, String> {
 /// `scout stop [repo]`: ends the server of one repository, or all of them (they start again when asked).
 pub fn stop(repo: Option<&str>, dry_run: bool) -> Result<u8, String> {
     let wanted = repo.map(|repo| fs::canonicalize(repo).map(|path| path.to_string_lossy().into_owned()).unwrap_or_else(|_| repo.to_owned()));
-    for (pid, served, _) in servers().into_iter().filter(|(_, served, _)| wanted.as_ref().is_none_or(|wanted| served == wanted)) {
-        step(dry_run, &format!("stop the server of {served} (pid {pid})"), || {
-            // The whole tree: a language server still loading a project (gigabytes) must not outlive it.
-            crate::resources::kill_tree(pid);
-            // Gone before returning: a question asked right after must start a new server, not reach this one.
-            for _ in 0..100 {
-                if run_quietly("kill", &["-0", &pid.to_string()]).is_err() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+    for server in daemon::running_servers().into_iter().filter(|server| wanted.as_ref().is_none_or(|wanted| &server.repo == wanted)) {
+        step(dry_run, &format!("stop the server of {} (pid {})", server.repo, server.pid), || {
+            daemon::stop_server(&server);
             Ok(())
         });
     }
@@ -289,9 +264,9 @@ pub fn stop(repo: Option<&str>, dry_run: bool) -> Result<u8, String> {
 
 /// `scout logs [repo]`: the end of each server's log (a hang names the question and the processes there).
 pub fn logs(repo: Option<&str>) -> Result<u8, String> {
-    for (_, served, log) in servers().into_iter().filter(|(_, served, _)| repo.is_none_or(|repo| served.contains(repo))) {
-        println!("== {served} ({})", log.display());
-        let text = fs::read_to_string(&log).unwrap_or_default();
+    for server in daemon::running_servers().into_iter().filter(|server| repo.is_none_or(|repo| server.repo.contains(repo))) {
+        println!("== {} ({})", server.repo, server.log.display());
+        let text = fs::read_to_string(&server.log).unwrap_or_default();
         let lines: Vec<&str> = text.lines().collect();
         for line in &lines[lines.len().saturating_sub(30)..] {
             println!("{line}");

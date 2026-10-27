@@ -41,6 +41,11 @@ fn memory_kb(pid: u32) -> u64 {
     field("smaps_rollup", "Pss:").or_else(|| field("status", "VmRSS:")).unwrap_or(0)
 }
 
+/// Memory a process and everything it started spend now (MB), counted as `Cost:` counts it.
+pub fn tree_memory_mb(pid: u32) -> u64 {
+    with_descendants(vec![pid]).into_iter().map(memory_kb).sum::<u64>() / 1024
+}
+
 /// A line of `/proc/meminfo` in MB (`MemTotal`, `MemAvailable`); None where the system does not report it.
 pub fn system_memory_mb(field: &str) -> Option<u64> {
     let text = fs::read_to_string("/proc/meminfo").ok()?;

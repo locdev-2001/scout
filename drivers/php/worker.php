@@ -292,9 +292,15 @@ final class WorkerPool
     /** @param Closure(string, array): mixed $dispatch runs one task in the child */
     public function __construct(private readonly int $size, private readonly Closure $dispatch) {}
 
+    /**
+     * Workers kept forked while idle. One answers a single-file question at once; a question that needs more forks
+     * them on demand (they share the parent's memory until they write), so an idle driver does not hold a full set.
+     */
+    private const IDLE_WORKERS = 1;
+
     public function needsWorkers(): bool
     {
-        return ! ForkedWorker::inline() && count($this->idle) < $this->size;
+        return ! ForkedWorker::inline() && count($this->idle) < min($this->size, self::IDLE_WORKERS);
     }
 
     /** Reaps finished children and forks one idle worker; called only while no request is waiting. */
