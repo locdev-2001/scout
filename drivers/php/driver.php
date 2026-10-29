@@ -10,6 +10,7 @@ require __DIR__.'/fact-extraction.php';
 require __DIR__.'/fact-store.php';
 
 $repoRoot = rtrim(realpath($argv[1] ?? '') ?: '', '/');
+limitCompiledCode();
 loadComposerAutoload($repoRoot);
 
 /** What a pooled child can be asked to do; defined before any child is forked, so every child has it. */

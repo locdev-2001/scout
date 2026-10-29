@@ -42,6 +42,9 @@ struct DriverManifest {
     /// languages go to the generic driver (calls by name), and every answer says why.
     #[serde(default)]
     requires: Vec<Requirement>,
+    /// Directories the driver needs before it starts (`{cache}/php-opcache`), made when missing.
+    #[serde(default)]
+    directories: Vec<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -113,8 +116,15 @@ impl Driver {
         let (program, args) = manifest.command.split_first().ok_or(format!("{name}: driver.json has no command"))?;
         // `{scout}` is this very binary, so a driver built into it needs no shell script (Windows included).
         let program = if program == "{scout}" { crate::daemon::own_binary().map_err(|error| error.to_string())?.to_string_lossy().into_owned() } else { program.clone() };
+        // `{cache}` in an argument or a directory is the saved-analysis directory.
+        let cache = crate::daemon::cache_directory();
+        let placed = |text: &String| text.replace("{cache}", &cache.to_string_lossy());
+        for directory in manifest.directories.iter().map(placed) {
+            let _ = fs::create_dir_all(directory);
+        }
+        let args: Vec<String> = args.iter().map(placed).collect();
         let mut child = Command::new(&program)
-            .args(args)
+            .args(&args)
             .arg(&repo_root)
             .current_dir(&directory)
             .env("SCOUT_CLAIMED_EXTENSIONS", &claimed_extensions)

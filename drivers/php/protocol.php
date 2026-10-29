@@ -90,6 +90,33 @@ function composerClassFile(string $class): ?string
     return null;
 }
 
+/** Compiled code PHP keeps on disk past this size is dropped when a driver starts, and compiled again as needed. */
+const COMPILED_CODE_LIMIT_BYTES = 512 << 20;
+
+/**
+ * Keeps the compiled-code cache (`opcache.file_cache`, one copy of each file per checkout path, so it grows with
+ * every worktree) under its limit. Compiled code on disk instead of in shared memory: a driver and the children it
+ * forks no longer hold every compiled file of the application in memory.
+ */
+function limitCompiledCode(): void
+{
+    $directory = (string) ini_get('opcache.file_cache');
+    if ($directory === '' || ! is_dir($directory)) {
+        return;
+    }
+    $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+    $bytes = 0;
+    foreach ($files as $file) {
+        $bytes += $file->isFile() ? $file->getSize() : 0;
+    }
+    if ($bytes <= COMPILED_CODE_LIMIT_BYTES) {
+        return;
+    }
+    foreach ($files as $file) {
+        $file->isDir() ? @rmdir($file->getPathname()) : @unlink($file->getPathname());
+    }
+}
+
 function loadComposerAutoload(string $repoRoot): void
 {
     $autoload = $repoRoot.'/vendor/autoload.php';

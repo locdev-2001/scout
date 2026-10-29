@@ -918,6 +918,7 @@ final class LaravelWiring implements BackgroundWork
 }
 
 $repoRoot = rtrim(realpath($argv[1] ?? '') ?: '', '/');
+limitCompiledCode();
 loadComposerAutoload($repoRoot);
 $wiring = new LaravelWiring(new PhpFileCache($repoRoot), new EngineGuard($repoRoot));
 $wiring->startTraitWarmUp();
