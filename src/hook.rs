@@ -448,7 +448,8 @@ fn by_repository(changed: Vec<ChangedLines>) -> std::collections::BTreeMap<PathB
 }
 
 /// The functions (and classes) around changed lines, each once; a change outside any (an import, a file-level
-/// statement) names none.
+/// statement) names none, though drivers name it (`app/x.php`, `a.ts#(module)`, `x.go#(file)`): its "callers" are the
+/// files loading it, not code that depends on what changed.
 /// `start` lets the question start the repository's server.
 fn changed_symbols(repo: &Path, places: Vec<ChangedLines>, deadline: Instant, start: bool) -> Result<Vec<String>, Outcome> {
     let files: Vec<String> = places.iter().map(|place| place.file.clone()).collect();
@@ -459,7 +460,8 @@ fn changed_symbols(repo: &Path, places: Vec<ChangedLines>, deadline: Instant, st
     }
     let mut symbols: Vec<String> = Vec::new();
     for (_, response) in replies.answered {
-        for symbol in response.stdout.lines().filter_map(|line| line.split("  ").next()).filter(|symbol| !symbol.is_empty() && !files.iter().any(|file| file == symbol)) {
+        let file_level = |symbol: &str| files.iter().any(|file| file == symbol) || symbol.rsplit_once('#').is_some_and(|(_, name)| name.starts_with('('));
+        for symbol in response.stdout.lines().filter_map(|line| line.split("  ").next()).filter(|symbol| !symbol.is_empty() && !file_level(symbol)) {
             if !symbols.iter().any(|known| known == symbol) {
                 symbols.push(symbol.to_owned());
             }
