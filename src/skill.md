@@ -35,9 +35,16 @@ scout locate app/Services/OrderService.php:120               # which function a 
 
 ## While you change code
 
-The hooks add the direct callers of each function you change, whatever changed it (an edit, a written file, a
-script), and at the end of a turn they list the changed functions whose callers you have not seen yet. Check that
-each caller still fits the change before finishing.
+The hooks bring the callers to you; you do not need to ask for them at these moments:
+
+- a prompt with a stack-trace line (`app/X.php:57`) or a `Class::method`: its callers come with the prompt;
+- before an `Edit`: the direct callers of the function being edited, so the change is made knowing them;
+- a grep for a function name: its callers;
+- after any change (an edit, a written file, a script): the callers of each changed function not shown yet;
+- at the end of a turn: the changed functions whose callers you have not seen yet.
+
+Read each caller and keep it working, or change it too, before finishing. Ask `scout callers` yourself for anything
+deeper (`--depth 2`, the entry points) or for code you are about to delete or rename.
 
 ## When not to use it
 

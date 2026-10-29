@@ -28,7 +28,7 @@ scout là một lệnh dòng lệnh kèm MCP server. Bạn đưa tên một hàm
 - Mỗi ngôn ngữ dùng chính bộ phân tích của ngôn ngữ đó (tokenizer PHP, parser TypeScript, `ast` của CPython, `rust-analyzer`), không đoán bằng regex.
 - Thà thừa còn hơn sót: chỗ nào không chắc vẫn được liệt kê, gắn `unresolved`, để bạn đọc tay.
 - Kết quả luôn khớp code hiện tại: file vừa lưu được cập nhật ngay, và mỗi lần hỏi đều kiểm lại để không trả lời bằng dữ liệu cũ.
-- Agent dùng được ngay: MCP server cho Claude Code và Codex, cùng hook để agent thấy người gọi ngay khi sửa hay grep một hàm, và được nhắc trước khi kết thúc lượt nếu còn hàm đã đổi mà chưa xem người gọi.
+- Agent dùng được ngay mà không phải nhớ gọi: MCP server cho Claude Code và Codex, cùng hook đưa người gọi vào đúng lúc cần: trước khi sửa một hàm, khi prompt dán stack trace, khi grep tên hàm, sau khi đổi code, và trước khi kết thúc lượt nếu còn hàm đã đổi mà chưa xem người gọi.
 
 scout không thay grep. Nó trả lời một câu: đổi chỗ này thì ảnh hưởng tới đâu. Tìm định nghĩa, chuỗi, khoá cấu hình, dòng log vẫn là việc của `grep`/`rg`.
 
@@ -84,7 +84,7 @@ Mỗi ngôn ngữ hiểu code bằng công cụ của chính nó:
 - [x] Monorepo pnpm, yarn, bun, npm workspace: import gói nội bộ được nối tới file nguồn qua `exports`/`types`/`main`
 - [x] Lời gọi ngầm của Python (`with`, `for`, `len(x)`, `__getattr__`...) và Rust (`?`, `Display`, `Iterator`, `Deref`...)
 - [x] `scout locate file:dòng,dòng,…`: các hàm quanh nhiều dòng một lần
-- [x] MCP server (`callers`, `locate`) và hook cho Claude Code: người gọi của hàm vừa đổi dù đổi bằng cách nào, nhắc một lần cuối lượt
+- [x] MCP server (`callers`, `locate`) và hook cho Claude Code: người gọi của hàm sắp sửa (trước `Edit`), của dòng stack trace hay `Class::method` trong prompt, của hàm vừa đổi dù đổi bằng cách nào, nhắc một lần cuối lượt
 - [x] Ngôn ngữ khác (C/C++, Java, C#, Go...): mọi chỗ gọi theo tên, gắn `unresolved`
 
 ## Cài đặt
@@ -101,10 +101,13 @@ Lệnh này build công cụ rồi chạy `scout setup`, làm trọn mọi bư�
 - gắn MCP server cho Claude Code và Codex (agent khác: thêm MCP server chạy `scout mcp`);
 - gắn hook cho Claude Code:
   - phiên vừa mở: tiến trình nền của repo bắt đầu đọc code, và scout ghi lại commit gốc để biết phiên này đổi gì;
+  - người dùng gửi prompt: tiến trình nền đã tự tắt vì rảnh được bật lại; prompt có dòng stack trace (`app/X.php:57`, `X.php(57)` của PHP, `File "x.py", line 57` của Python, kể cả đường dẫn của máy chủ như `/var/www/html/app/...`, bỏ qua frame trong `vendor`/`node_modules`) hay `Class::method`/`Class@method` thì agent nhận người gọi của chỗ đó ngay cùng prompt;
+  - trước khi agent sửa bằng `Edit`/`MultiEdit`: scout tìm hàm chứa đoạn sắp bị thay và đưa người gọi trực tiếp của nó, để agent sửa khi đã biết ai phụ thuộc. Server ấm: khoảng 60 ms; không bao giờ giữ lần sửa quá 1,5 giây;
   - sau mỗi lần agent đổi code, dù bằng `Edit`, `Write` hay một lệnh shell (`sed -i`, script Python): scout so file với commit gốc, tìm hàm quanh các dòng đổi và đưa ngay danh sách người gọi của hàm agent chưa xem. Lệnh shell không đổi file nào chỉ tốn một lần `git status`;
   - trước khi agent kết thúc lượt (gồm cả thay đổi do subagent làm): nếu còn hàm đã đổi trong phiên mà agent chưa xem người gọi, scout đưa danh sách đó và agent đi tiếp một vòng để kiểm. Mỗi hàm chỉ được nhắc một lần, kể cả khi agent đã commit giữa chừng;
   - agent grep một tên hàm (kể cả trong `$( … )` hay nhiều lần tìm nối nhau): nó nhận thêm danh sách người gọi chính xác. Lệnh grep vẫn chạy như thường, hook chỉ thêm 15 ms ở trung vị và không bao giờ quá 1,5 giây; grep lọc output của lệnh khác hay tìm trong `.env`, `.md`, `.json` thì bị bỏ qua. Lần grep đầu tiên trong một repo chưa có tiến trình nền sẽ bật nó lên, nên có thể chưa kèm kết quả;
-  - agent tự hỏi `callers` (MCP hay CLI) thì hàm đó được tính là đã xem;
+  - agent tự hỏi `callers` (MCP hay CLI) thì hàm đó được tính là đã xem; hàm đã được đưa ở bước nào thì không được nhắc lại ở bước sau;
+  - mỗi lần hook đưa được người gọi cho agent, người dùng thấy một dòng như `scout: callers of App\Services\OrderService::place given to Claude`;
 - thêm vài dòng hướng dẫn vào `~/.claude/CLAUDE.md` và `~/.codex/AGENTS.md`;
 - cài bộ đọc JavaScript dự phòng cho dự án không có `typescript` riêng;
 - báo máy có những gì để phân tích code (PHP, Node, Python, rust-analyzer).
@@ -194,7 +197,9 @@ scout nói thẳng chỗ nó không chắc thay vì im lặng bỏ qua.
 
 - Hàm được cất vào thuộc tính để gọi sau (`$this->xuLy = [$this, 'guiThu']`) là `unresolved`: ai gọi nó là chỗ đọc thuộc tính đó.
 - Method trong class vô danh (`new class extends Mau { ... }`) có tên dạng `ClassBaoNgoai@anonymous_<dòng>::tenHam`. Người gọi của nó là người gọi cùng method ở class cha hoặc interface, gắn `likely`.
-- Nếu một file làm PHP dừng hẳn khi nạp, scout báo rõ file đó chưa phân tích được. File thuộc phần test chỉ được báo khi bạn hỏi kèm `--tests`.
+- Nếu một file làm PHP dừng hẳn khi nạp (ví dụ một method khai báo hai lần), scout báo rõ file đó và những file phụ thuộc nó chưa phân tích được, các file khác vẫn trả lời; sửa xong thì lần đổi file kế tiếp đọc lại chúng. File thuộc phần test chỉ được báo khi bạn hỏi kèm `--tests`.
+- Class có `__call` chuyển lời gọi đi (JSON resource sang model) và docblock `@mixin X`: method nó không khai báo được nối tới `X`, gắn `likely`.
+- Git worktree có `vendor/` là symlink sang checkout khác: class của chính dự án vẫn được nạp từ worktree, không phải từ nhánh của checkout kia.
 - Laravel gọi nhiều thứ theo quy ước, không viết tên ra. Tool nối được: scope `scopeDangBan` ← `->dangBan()`, accessor `getHoTenAttribute` ← `->ho_ten`, middleware ← các route nó gắn (gom thành một dòng khi nhiều), form request ← action nhận nó, policy ← `authorize('sua', ...)`/`can(...)`, class phía sau facade ← `Cache::remember(...)`, `__call` ← lời gọi method không khai báo, macro (`Builder::macro('tenMacro', ...)` thành method `Builder::tenMacro`) ← mọi `->tenMacro(`.
 - Dự án lớn: lần đầu tiến trình nền đọc hết mọi file (khoảng 30 giây với 5.000 file). Câu hỏi đến trong lúc đó vẫn đúng nhưng mất vài giây; sau đó mỗi câu vài chục mili giây.
 - PHP dùng `rg` (ripgrep) để tìm file nhanh nếu máy có; không có thì scout dựng một lần chỉ mục từ → file (khoảng 0,7 giây với 5.000 file) và chỉ đọc những file có chữ cần tìm, cùng kết quả.
