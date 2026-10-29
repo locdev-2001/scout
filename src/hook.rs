@@ -632,9 +632,11 @@ fn is_separator(word: &str) -> bool {
 }
 
 /// Options of grep, rg, ag and ack written apart from their value (`-g '*.php'`, `--max-depth 2`).
-const VALUED_OPTIONS: [&str; 26] = [
-    "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "--context", "--after-context", "--before-context", "-m", "--max-count",
-    "--include", "--exclude", "--exclude-dir", "-d", "--max-depth", "-j", "--threads", "-M", "--max-columns", "-r", "--replace",
+/// Short options that take a value in one tool and none in another (`-r`: rg's replacement, grep's recursion) are left
+/// out: their long form is listed.
+const VALUED_OPTIONS: [&str; 22] = [
+    "-g", "--glob", "--iglob", "-t", "--type", "--type-not", "-A", "-B", "-C", "--context", "--after-context", "--before-context", "-m", "--max-count",
+    "--include", "--exclude", "--exclude-dir", "--max-depth", "-j", "--threads", "--max-columns", "--replace",
 ];
 
 /// The pattern of one search and the first path after it, as written.
