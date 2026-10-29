@@ -35,7 +35,10 @@ const SEARCH_BUDGET: Duration = Duration::from_millis(1500);
 /// At the end of a turn the agent is done working: a longer wait buys the callers of everything it changed.
 const FINISH_BUDGET: Duration = Duration::from_secs(20);
 /// Words a search may start with that name no function.
-const KEYWORDS: [&str; 16] = ["function", "class", "def", "return", "public", "private", "protected", "static", "const", "import", "export", "async", "await", "interface", "trait", "struct"];
+const KEYWORDS: [&str; 23] = [
+    "function", "class", "def", "func", "return", "public", "private", "protected", "static", "const", "import", "export", "async", "await", "interface", "trait",
+    "struct", "enum", "namespace", "package", "module", "require", "include",
+];
 /// Lines of answer one hook adds at most: enough for the direct callers, small enough for the context.
 const MAX_LINES: usize = 40;
 /// Names asked about at most per search command: the server answers one question at a time, so each extra one can
@@ -482,7 +485,8 @@ fn planned_search(input: &Value) -> Option<Result<PlannedSearch, Outcome>> {
     for (pattern, place) in branches {
         let Some(name) = searched_name(&pattern) else { continue };
         named = true;
-        if place.is_file() && !holds_code(&place) {
+        // A file without an extension (a Makefile, a shell script) is no code any driver reads.
+        if place.is_file() && (!holds_code(&place) || place.extension().is_none()) {
             continue;
         }
         let Some(place_repo) = place.parent().filter(|_| place.is_file()).or(Some(&place)).and_then(repo_root) else { continue };
@@ -548,7 +552,9 @@ fn searched(command: &str, cwd: &Path) -> Vec<(String, PathBuf)> {
             }
         }
         let is_search = ["rg", "grep", "egrep", "ag", "ack"].contains(&word.as_str()) || word.ends_with("/rg") || word.ends_with("/grep");
-        let reads_output = index > 0 && words[index - 1] == "|";
+        // `| command grep x` reads the output too: `command` only skips shell functions and aliases.
+        let before = if index > 0 && words[index - 1] == "command" { index - 1 } else { index };
+        let reads_output = before > 0 && words[before - 1] == "|";
         if is_search && !reads_output {
             let in_git = index > 0 && words[index - 1] == "git";
             let arguments: Vec<&String> = words[index + 1..].iter().take_while(|word| !is_separator(word)).collect();
@@ -599,6 +605,12 @@ fn is_separator(word: &str) -> bool {
     word == "|" || word == ";"
 }
 
+/// Options of grep, rg, ag and ack written apart from their value (`-g '*.php'`, `--max-depth 2`).
+const VALUED_OPTIONS: [&str; 26] = [
+    "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "--context", "--after-context", "--before-context", "-m", "--max-count",
+    "--include", "--exclude", "--exclude-dir", "-d", "--max-depth", "-j", "--threads", "-M", "--max-columns", "-r", "--replace",
+];
+
 /// The pattern of one search and the first path after it, as written.
 fn one_search<'a>(arguments: &[&'a String]) -> Option<(String, Option<&'a String>)> {
     let mut rest = arguments.iter();
@@ -613,7 +625,7 @@ fn one_search<'a>(arguments: &[&'a String]) -> Option<(String, Option<&'a String
         }
         if word.starts_with('-') {
             // An option's value (`-g '*.php'`, `-t php`) is no pattern.
-            if ["-g", "--glob", "-t", "--type", "-A", "-B", "-C", "-m", "--max-count", "--include"].contains(&word.as_str()) {
+            if VALUED_OPTIONS.contains(&word.as_str()) {
                 rest.next();
             }
             continue;
@@ -667,7 +679,9 @@ fn shell_words(command: &str) -> Vec<String> {
 /// The function name a search pattern looks for (`saveOrder(`, `->saveOrder`, `\bsave_order\(`, `def save_order`),
 /// or None when it looks for something else (a phrase, a regex, a word too short to mean one function).
 fn searched_name(pattern: &str) -> Option<String> {
-    let mut name = pattern.trim().to_owned();
+    // `^\s*function\s+save\s*\(`: anchors and whitespace classes say where the name stands, not what it is.
+    let mut name = pattern.replace("\\s+", " ").replace("[[:space:]]+", " ").replace("\\s*", "").replace("[[:space:]]*", "");
+    name = name.trim().trim_start_matches('^').trim_end_matches('$').trim().to_owned();
     // `public static function save`, `pub async fn save`: the modifiers before the keyword say nothing of the name.
     for modifier in ["public ", "private ", "protected ", "static ", "final ", "abstract ", "pub ", "pub(crate) ", "async ", "export ", "default "] {
         while let Some(rest) = name.strip_prefix(modifier) {
