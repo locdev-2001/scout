@@ -383,8 +383,18 @@ final class WorkerPool
                 fwrite($worker[1], pack('J', strlen($message)).$message);
                 $running[$index] = $worker;
             }
-            foreach ($running as $index => [$pid, $stream]) {
-                $results[$index] = ForkedWorker::finish($pid, $stream);
+            try {
+                foreach ($running as $index => [$pid, $stream]) {
+                    unset($running[$index]);
+                    $results[$index] = ForkedWorker::finish($pid, $stream);
+                }
+            } catch (RuntimeException $error) {
+                // The rest of the wave is let go (and reaped later), not left to linger as zombies.
+                foreach ($running as [$pid, $stream]) {
+                    fclose($stream);
+                    ForkedWorker::released($pid);
+                }
+                throw $error;
             }
         }
         ksort($results);
@@ -488,6 +498,7 @@ final class EngineGuard
             if (function_exists('opcache_invalidate')) {
                 opcache_invalidate($absolute, true);
             }
+            forgetCompiled($absolute);
             if (in_array($path, $restartInputs, true)) {
                 self::restart("{$path} changed");
             }

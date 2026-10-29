@@ -127,6 +127,25 @@ function limitCompiledCode(): void
     }
 }
 
+/**
+ * Drops the compiled copies of a changed file. A file cache is checked against the file's modification time to the
+ * second only and `opcache_invalidate()` does not reach it: a file written twice in one second (or restored with its
+ * old time) would otherwise be run as it was, by every child and after every restart.
+ */
+function forgetCompiled(string $absolutePath): void
+{
+    $directory = (string) ini_get('opcache.file_cache');
+    if ($directory === '') {
+        return;
+    }
+    $paths = array_unique([$absolutePath, realpath($absolutePath) ?: $absolutePath]);
+    foreach (glob($directory.'/*', GLOB_ONLYDIR) ?: [] as $system) {
+        foreach ($paths as $path) {
+            @unlink($system.$path.'.bin');
+        }
+    }
+}
+
 function loadComposerAutoload(string $repoRoot): void
 {
     $autoload = $repoRoot.'/vendor/autoload.php';
