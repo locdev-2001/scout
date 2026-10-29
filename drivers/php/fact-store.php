@@ -715,14 +715,18 @@ final class FactStore implements BackgroundWork
         unset($fileFacts['sites']);
         $fileFacts['byName'] = $byName;
         $fileFacts['mentions'] = array_flip($fileFacts['mentions']);
-        $fileFacts['answerHash'] = self::answerHash($fileFacts);
+        // Saved facts carry the hash they had: computing it again for every file is most of reading them back.
+        $fileFacts['answerHash'] ??= self::answerHash($fileFacts);
         $this->fileFacts[$path] = $fileFacts;
         foreach (array_keys($byName) as $name) {
             $this->pathsByName[$name][$path] = true;
         }
         $this->indexConstructions($path, $byName['__construct'] ?? [], true);
-        $this->declaredClasses = $fileFacts['classes'] + $this->declaredClasses;
-        $this->declaringFile = array_fill_keys(array_keys($fileFacts['classes']), $path) + $this->declaringFile;
+        // Key by key: `$new + $all` would copy every class known so far for each file read.
+        foreach ($fileFacts['classes'] as $class => $declared) {
+            $this->declaredClasses[$class] = $declared;
+            $this->declaringFile[$class] = $path;
+        }
         if ($fileFacts['classes'] !== []) {
             $this->descendants = null;
         }
@@ -1005,7 +1009,7 @@ final class FactStore implements BackgroundWork
                 // Back to the form fileFacts() returns, which storeFile() reads.
                 $facts['sites'] = $facts['byName'] === [] ? [] : array_merge(...array_values($facts['byName']));
                 $facts['mentions'] = array_keys($facts['mentions']);
-                unset($facts['byName'], $facts['answerHash']);
+                unset($facts['byName']);
                 $files[$file] = $facts;
                 foreach ($facts['deps'] as $dependency) {
                     if (! isset($stored[$dependency]) && str_ends_with($dependency, '.php')) {
