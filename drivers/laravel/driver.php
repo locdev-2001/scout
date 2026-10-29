@@ -662,12 +662,15 @@ final class LaravelWiring implements BackgroundWork
         // Eloquent reaches some methods by a name derived from theirs: `scopeActive` as `->active()`,
         // `getFullNameAttribute` as `->full_name`.
         // One a trait declares is reached through each class using it (`Combo::query()->workspaceLevel()`).
-        $owners = ($this->traitsOf($class)['trait'] ?? false) ? $this->classesUsing($class) : [$class];
-        foreach ($owners as $owner) {
-            if (preg_match('/^scope(\w+)$/', $method, $match)) {
-                array_push($edges, ...$this->conventionUses($owner, lcfirst($match[1]), true));
-            } elseif (preg_match('/^get(\w+)Attribute$/', $method, $match)) {
-                array_push($edges, ...$this->conventionUses($owner, \Illuminate\Support\Str::snake($match[1]), false));
+        $convention = match (true) {
+            (bool) preg_match('/^scope(\w+)$/', $method, $match) => [lcfirst($match[1]), true],
+            (bool) preg_match('/^get(\w+)Attribute$/', $method, $match) => [\Illuminate\Support\Str::snake($match[1]), false],
+            default => null,
+        };
+        if ($convention !== null) {
+            $owners = ($this->traitsOf($class)['trait'] ?? false) ? $this->classesUsing($class) : [$class];
+            foreach ($owners as $owner) {
+                array_push($edges, ...$this->conventionUses($owner, ...$convention));
             }
         }
 
@@ -715,17 +718,19 @@ final class LaravelWiring implements BackgroundWork
     }
 
     /**
-     * The classes whose body has `use Trait;`, read from the files that name the trait.
+     * The classes whose body has `use Trait;` (the name resolved through the file's imports), read from the files
+     * that name the trait; through a trait using it, the classes using that one in turn.
      *
+     * @param  array<string, true>  $seen  lowercase traits already followed
      * @return list<string>
      */
-    private function classesUsing(string $trait): array
+    private function classesUsing(string $trait, array $seen = []): array
     {
-        $short = strtolower(substr(strrchr('\\'.$trait, '\\'), 1));
-        $uses = $this->scanTokens("uses|{$trait}", [$short], ['--word-regexp', '--fixed-strings', '--ignore-case', '-e', $short], function ($file, int $index) use ($short) {
+        $key = strtolower(ltrim($trait, '\\'));
+        $short = substr(strrchr('\\'.$key, '\\'), 1);
+        $uses = $this->scanTokens("uses|{$key}", [$short], ['--word-regexp', '--fixed-strings', '--ignore-case', '-e', $short], function ($file, int $index) use ($key) {
             $tokens = $file->tokens;
-            $name = strtolower(ltrim($tokens[$index]->text, '\\'));
-            if ($name !== $short && ! str_ends_with($name, '\\'.$short)) {
+            if (! in_array($tokens[$index]->id, [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED], true)) {
                 return null;
             }
             // `use A, Trait;` in a class body: names and commas back to `use` (a closure's `use (` has a parenthesis).
@@ -733,11 +738,25 @@ final class LaravelWiring implements BackgroundWork
             while ($back > 0 && ($tokens[$back]->text === ',' || in_array($tokens[$back]->id, [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED], true))) {
                 $back--;
             }
+            if ($tokens[$back]->id !== T_USE || $file->innermostScopeAtToken($index)?->kind !== 'class') {
+                return null;
+            }
 
-            return $tokens[$back]->id === T_USE && $file->innermostScopeAtToken($index)?->kind === 'class' ? ['uses', 'exact'] : null;
+            return strtolower(ltrim((string) $file->resolveClassName($tokens[$index]->text, null), '\\')) === $key ? ['uses', 'exact'] : null;
         });
+        $seen[$key] = true;
+        $owners = [];
+        foreach (array_unique(array_map(fn (array $edge) => $edge['from']['symbol'], $uses)) as $owner) {
+            if (isset($seen[strtolower($owner)])) {
+                continue;
+            }
+            $owners[] = $owner;
+            if ($this->traitsOf($owner)['trait'] ?? false) {
+                array_push($owners, ...$this->classesUsing($owner, $seen));
+            }
+        }
 
-        return array_values(array_unique(array_map(fn (array $edge) => $edge['from']['symbol'], $uses)));
+        return array_values(array_unique($owners));
     }
 
     /**
