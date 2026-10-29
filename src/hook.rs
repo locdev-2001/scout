@@ -814,9 +814,10 @@ fn record(event: &str, repo: &Path, asked: &[String], outcome: Outcome, started:
         "ms": started.elapsed().as_millis() as u64,
     });
     if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LOG_BYTES) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let half = text.len() / 2;
-            let kept = text[half..].split_once('\n').map_or("", |(_, rest)| rest);
+        // Cut as bytes at a line end: the middle byte may fall inside a character of a path or a name.
+        if let Ok(bytes) = std::fs::read(&path) {
+            let half = bytes.len() / 2;
+            let kept = bytes[half..].iter().position(|byte| *byte == b'\n').map_or(&[][..], |end| &bytes[half + end + 1..]);
             let _ = std::fs::write(&path, kept);
         }
     }
