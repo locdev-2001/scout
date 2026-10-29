@@ -560,6 +560,11 @@ final class PhpFileCache
 
     public function relativePath(string $absolutePath): ?string
     {
+        // Code loaded from the checkout whose vendor/ this one shares (helpers Composer requires up front).
+        $sharedRoot = sharedCheckoutRoot($this->repoRoot);
+        if ($sharedRoot !== null) {
+            $absolutePath = checkoutPath($absolutePath, $sharedRoot, $this->repoRoot);
+        }
         $prefix = $this->repoRoot.'/';
 
         return str_starts_with($absolutePath, $prefix) ? substr($absolutePath, strlen($prefix)) : null;

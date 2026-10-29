@@ -96,5 +96,50 @@ function loadComposerAutoload(string $repoRoot): void
     if (! is_file($autoload)) {
         throw new RuntimeException("missing $autoload: run composer install");
     }
-    require_once $autoload;
+    $loader = require_once $autoload;
+    $sharedRoot = sharedCheckoutRoot($repoRoot);
+    if ($sharedRoot === null || ! $loader instanceof Composer\Autoload\ClassLoader) {
+        return;
+    }
+    // PHP resolves the link, so Composer would load the repository's own classes from the other checkout: another
+    // branch's code. They are loaded from this one.
+    $here = fn (string $path) => checkoutPath($path, $sharedRoot, $repoRoot);
+    foreach ($loader->getPrefixesPsr4() as $prefix => $paths) {
+        $loader->setPsr4($prefix, array_map($here, $paths));
+    }
+    foreach ($loader->getPrefixes() as $prefix => $paths) {
+        $loader->set($prefix, array_map($here, $paths));
+    }
+    $loader->addClassMap(array_map($here, $loader->getClassMap()));
+}
+
+/**
+ * The checkout whose vendor/ this repository's vendor/ links to (a git worktree sharing the main checkout's
+ * packages), or null when vendor/ is its own.
+ */
+function sharedCheckoutRoot(string $repoRoot): ?string
+{
+    static $roots = [];
+    if (! array_key_exists($repoRoot, $roots)) {
+        $vendor = realpath($repoRoot.'/vendor');
+        $roots[$repoRoot] = $vendor !== false && $vendor !== $repoRoot.'/vendor' ? dirname($vendor) : null;
+    }
+
+    return $roots[$repoRoot];
+}
+
+/** A path into the shared checkout's own code (not its packages) as the same path in this repository. */
+function checkoutPath(string $path, string $sharedRoot, string $repoRoot): string
+{
+    $parts = [];
+    foreach (explode('/', $path) as $index => $part) {
+        if ($part === '..') {
+            array_pop($parts);
+        } elseif ($part !== '.' && ($part !== '' || $index === 0)) {
+            $parts[] = $part;
+        }
+    }
+    $normalized = implode('/', $parts);
+
+    return str_starts_with($normalized, $sharedRoot.'/') && ! str_starts_with($normalized, $sharedRoot.'/vendor/') ? $repoRoot.substr($normalized, strlen($sharedRoot)) : $path;
 }
