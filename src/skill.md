@@ -37,7 +37,8 @@ scout locate app/Services/OrderService.php:120               # which function a 
 
 The hooks bring the callers to you; you do not need to ask for them at these moments:
 
-- a prompt with a stack-trace line (`app/X.php:57`) or a `Class::method`: its callers come with the prompt;
+- a prompt with a stack-trace line (`app/X.php:57`), a `Class::method` or a function name written as code: its
+  callers come with the prompt;
 - before an `Edit` or a `Write` over a file: the direct callers of each function about to change, so the change is
   made knowing them (a function about to be deleted or renamed included);
 - a grep for a function name: its callers;

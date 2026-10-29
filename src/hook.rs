@@ -264,26 +264,42 @@ fn prompt(input: &Value) -> Option<Hint> {
     Some(Hint { context: format!("scout: who calls the code this prompt names (exact, with entry points; unresolved lines are listed for reading):\n{answers}"), symbols: callers.useful })
 }
 
-/// What a prompt names in the repository, in order and each once: `file:line` for a line of a code file there (a
-/// path from another machine is matched by its end), `Class::method` (or Laravel's `Class@method`) for a method.
+/// What a prompt names in the repository, each once: first the lines of code it points at (`file:line` for a line of
+/// a code file there, a path from another machine matched by its end), then the methods it names with their class
+/// (`Class::method`, Laravel's `Class@method`), then the function names it writes as code (`` `toSearchSlug` ``).
 fn named_code(text: &str, repo: &Path) -> Vec<String> {
-    let mut targets: Vec<String> = Vec::new();
+    let mut lines = Vec::new();
+    let mut methods = Vec::new();
     let words: Vec<&str> = text.split(|character: char| character.is_whitespace() || "`'\"<>[]{},;".contains(character)).filter(|word| !word.is_empty()).collect();
     for (index, word) in words.iter().enumerate() {
         // Python: `File "app/x.py", line 57`: the quotes and the comma split it into `app/x.py` `line` `57`.
         let python_line = (words.get(index + 1) == Some(&"line")).then(|| words.get(index + 2)).flatten().and_then(|line| line.parse::<u32>().ok());
-        let target = match python_line {
-            Some(line) => repo_file(word, repo).map(|file| format!("{file}:{line}")),
-            None => file_line(word, repo).or_else(|| method_name(word)),
-        };
-        if let Some(target) = target.filter(|target| !targets.contains(target)) {
-            targets.push(target);
-            if targets.len() == MAX_PROMPT_TARGETS {
-                break;
-            }
+        match python_line {
+            Some(line) => lines.extend(repo_file(word, repo).map(|file| format!("{file}:{line}"))),
+            None => match file_line(word, repo) {
+                Some(line) => lines.push(line),
+                None => methods.extend(method_name(word)),
+            },
         }
     }
+    let quoted = text.split('`').skip(1).step_by(2).map(|span| span.trim().trim_end_matches("()")).filter(|name| looks_like_function(name)).map(str::to_owned);
+    let mut targets: Vec<String> = Vec::new();
+    for target in lines.into_iter().chain(methods).chain(quoted) {
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets.truncate(MAX_PROMPT_TARGETS);
     targets
+}
+
+/// A name written the way functions are and words are not: camelCase, snake_case or PascalCase with a hump, at least
+/// five characters. A plain word (`status`) or a constant (`MAX_SIZE`) names no function worth asking about.
+fn looks_like_function(name: &str) -> bool {
+    let identifier = name.chars().next().is_some_and(|first| first.is_ascii_alphabetic() || first == '_') && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_');
+    let bytes = name.as_bytes();
+    let hump = bytes.windows(2).any(|pair| pair[0].is_ascii_lowercase() && (pair[1].is_ascii_uppercase() || pair[1] == b'_'));
+    identifier && name.len() >= 5 && hump
 }
 
 /// `path:line`, `path:line:column` or `path(line)` (PHP traces), from inside a frame's parentheses too.
