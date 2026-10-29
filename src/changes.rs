@@ -120,9 +120,11 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Each uncommitted code file of the repository (relative path) with a fingerprint of its content.
+/// Each uncommitted code file of the repository (relative path) with a fingerprint of its content. Untracked files
+/// are left out: a file the starting commit lacks has no changed lines to ask about, and listing them is most of what
+/// `git status` costs (22 ms against 8 on a 10,000-file repository, on every shell command).
 fn uncommitted_code(repo: &Path) -> BTreeMap<String, u64> {
-    let Some(status) = git(repo, &["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]) else { return BTreeMap::new() };
+    let Some(status) = git(repo, &["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=no"]) else { return BTreeMap::new() };
     status
         .split('\0')
         .filter_map(|entry| entry.get(3..))
