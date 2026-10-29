@@ -513,9 +513,32 @@ final class FactExtraction
             'trait' => $reflection->isTrait(),
             'methods' => $methods,
             'magic' => $reflection->hasMethod('__call') || $reflection->hasMethod('__callStatic'),
+            'mixins' => $this->mixinsOf($reflection),
             'units' => $units,
             'deps' => self::unitPaths($units),
         ];
+    }
+
+    /**
+     * Classes the docblock of the class or of a parent names with `@mixin`: where its `__call` hands on the methods
+     * it lacks (a JSON resource, its model).
+     *
+     * @return list<string>
+     */
+    private function mixinsOf(ReflectionClass $reflection): array
+    {
+        $mixins = [];
+        for ($class = $reflection; $class !== false; $class = $class->getParentClass()) {
+            if (! preg_match_all('/@mixin\s+([\\\\\w]+)/', (string) $class->getDocComment(), $matches)) {
+                continue;
+            }
+            $file = $this->files->forClass($class->getName());
+            foreach ($matches[1] as $name) {
+                $mixins[] = $file?->resolveClassName($name, $class->getName()) ?? ltrim($name, '\\');
+            }
+        }
+
+        return array_values(array_unique(array_filter($mixins)));
     }
 
     /** The symbol the source file declares at $line for $method (for a trait method: `Trait::method`). */

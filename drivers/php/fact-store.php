@@ -1528,7 +1528,7 @@ final class FactStore implements BackgroundWork
      * @param bool $fixed a call that names its class (`parent::m()`): it never reaches an override in a subclass
      * @param bool $abstract the target method has no body, so every implementation of it in the family counts
      */
-    private function matchType(string $type, array $target, string $method, bool $isConstructor, string $targetDeclaring, bool $fixed = false, bool $abstract = false): ?string
+    private function matchType(string $type, array $target, string $method, bool $isConstructor, string $targetDeclaring, bool $fixed = false, bool $abstract = false, bool $followMixins = true): ?string
     {
         $facts = $this->classFacts[strtolower(ltrim($type, '\\'))] ?? null;
         if ($facts === null) {
@@ -1550,6 +1550,16 @@ final class FactStore implements BackgroundWork
         // In a trait, `self::m()` runs as the class using it: any class of the target's family may be that one.
         if ((! $fixed || ! empty($facts['trait'])) && ! $isConstructor && isset($target['ancestorKeys'][$typeKey]) && $this->methodOf($facts, $method) !== null) {
             return 'likely';
+        }
+        // A method the class lacks goes to its `__call`, which hands it on to what `@mixin` names (one step: mixins
+        // may name each other).
+        if ($followMixins && $facts['magic'] && ! $isConstructor && ($facts['mixins'] ?? []) !== [] && $this->methodOf($facts, $method) === null) {
+            $this->ensureClasses($facts['mixins']);
+            foreach ($facts['mixins'] as $mixin) {
+                if ($this->matchType($mixin, $target, $method, false, $targetDeclaring, $fixed, $abstract, false) !== null) {
+                    return 'likely';
+                }
+            }
         }
 
         return null;
