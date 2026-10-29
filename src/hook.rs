@@ -259,7 +259,8 @@ fn prompt(input: &Value) -> Option<Hint> {
     }
     let callers = ask(&repo, targets.clone(), started + SEARCH_BUDGET, true);
     record("prompt", &repo, &targets, callers.outcome(), started);
-    with_session(session_id(input), |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
+    // A `file:line` question is shown as the symbol it stood for, so an edit of that function does not show it again.
+    with_session(session_id(input), |session| session.mark_shown(callers.answered.iter().chain(&callers.useful).map(String::as_str)));
     let answers = callers.text(MAX_LINES)?;
     Some(Hint { context: format!("scout: who calls the code this prompt names (exact, with entry points; unresolved lines are listed for reading):\n{answers}"), symbols: callers.useful })
 }
