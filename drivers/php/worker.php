@@ -271,10 +271,14 @@ final class ForkedWorker
      */
     public static function finish(int $pid, $stream): mixed
     {
-        $data = self::readUnlessStuck($pid, $stream);
-        fclose($stream);
-        if ($pid > 0) {
-            self::$unreaped[] = $pid;
+        // A worker ended for being stuck is closed and reaped like one that answered.
+        try {
+            $data = self::readUnlessStuck($pid, $stream);
+        } finally {
+            fclose($stream);
+            if ($pid > 0) {
+                self::$unreaped[] = $pid;
+            }
         }
         $payload = $data === '' ? null : Payload::decode($data);
         if (! is_array($payload)) {
