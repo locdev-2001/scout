@@ -147,8 +147,12 @@ function componentNameCandidates(path) {
   return names;
 }
 
-/** How bare specifiers map to files: the bundler's own answer when there is one, else tsconfig/jsconfig `paths`. */
-function readModuleResolution() {
+/**
+ * How bare specifiers map to files: the bundler's own answer when there is one, else tsconfig/jsconfig `paths`.
+ * `atStart`: the answer the last server saved is used while nothing it was read from changed (loading a Vite config
+ * starts Node and Vite again, about 170 ms).
+ */
+function readModuleResolution(atStart = false) {
   const warnings = [];
   const packages = workspacePackages();
   const packageFiles = packages.map((entry) => `${entry.dir ? `${entry.dir}/` : ''}package.json`);
@@ -156,8 +160,9 @@ function readModuleResolution() {
   const viteConfig = ['vite.config.js', 'vite.config.ts', 'vite.config.mjs', 'vite.config.mts', 'vite.config.cjs'].find((name) => existsSync(join(repoRoot, name)));
   if (viteConfig) {
     try {
-      const output = execFileSync(process.execPath, [driverPath, '--bundler-config', repoRoot], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 24 });
-      const config = JSON.parse(output);
+      const saved = atStart ? savedBundlerConfig() : null;
+      const config = saved ?? JSON.parse(execFileSync(process.execPath, [driverPath, '--bundler-config', repoRoot], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 24 }));
+      if (!saved) saveBundlerConfig(config, viteConfig);
       return {
         bundler: config.bundler,
         aliases: config.aliases,
@@ -193,6 +198,44 @@ function readModuleResolution() {
     }
   }
   return { bundler: configFiles[0] ?? 'none', aliases, extensions: VITE_DEFAULT_EXTENSIONS, baseUrl, inputs: [...new Set(['package.json', ...configFiles, ...(viteConfig ? [viteConfig] : []), ...packageFiles])], packages, autoComponents: {}, publicDir: null, entries: [], warnings };
+}
+
+function bundlerConfigPath() {
+  return join(dirname(FactStore.savedPath()), 'bundler-config.json');
+}
+
+/**
+ * What a loaded bundler configuration depends on: this driver, the files the config read, the installed Vite, and
+ * which component files exist (a plugin decides which file a tag name means).
+ */
+function bundlerConfigKey(inputs) {
+  let components = '';
+  try {
+    components = execFileSync('git', ['ls-files', '-co', '--exclude-standard', '-z', '--', '*.vue', '*.svelte'], { cwd: repoRoot, encoding: 'utf8', maxBuffer: 1 << 26 });
+  } catch {
+    // not a git checkout: the files are listed some other way, and the key stays without them
+  }
+  const stamps = [...new Set(inputs)].sort().map((path) => [path, fileStamp(path)]);
+  return createHash('sha1').update(JSON.stringify([readFileSync(driverPath), stamps, fileStamp('node_modules/vite/package.json'), components])).digest('hex');
+}
+
+function savedBundlerConfig() {
+  try {
+    const saved = JSON.parse(readFileSync(bundlerConfigPath(), 'utf8'));
+    return saved.key === bundlerConfigKey(saved.inputs) ? saved.config : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveBundlerConfig(config, viteConfig) {
+  const inputs = [...config.inputs, viteConfig, 'package.json'];
+  try {
+    mkdirSync(dirname(bundlerConfigPath()), { recursive: true });
+    writeFileSync(bundlerConfigPath(), JSON.stringify({ key: bundlerConfigKey(inputs), inputs, config }));
+  } catch {
+    // a read-only cache only costs the next start a loaded config
+  }
 }
 
 /**
@@ -2132,7 +2175,7 @@ let restartInputs;
 
 function serveDriver() {
   const startedAt = performance.now();
-  resolution = compileResolution(readModuleResolution());
+  resolution = compileResolution(readModuleResolution(true));
   profilePhase('start: module resolution', startedAt);
   restartInputs = new Set(resolution.inputs);
   const saved = ts ? FactStore.readSaved() : null;
