@@ -8,6 +8,30 @@ declare(strict_types=1);
  * reload a class inside one process. With OPcache on, children share compiled files through shared memory
  * and revalidate them against the disk on every include, so each child sees the code as it is now.
  */
+/**
+ * Values passed between processes and saved to disk. In igbinary's format when PHP has the extension: it stores a
+ * repeated string once and reads it back as one shared string, and facts repeat class, method and file names, so
+ * they take about half the memory and read twice as fast. Else in PHP's own format.
+ */
+final class Payload
+{
+    public static function encode(mixed $value): string
+    {
+        return function_exists('igbinary_serialize') ? igbinary_serialize($value) : serialize($value);
+    }
+
+    /** False when the bytes hold nothing this PHP can read. */
+    public static function decode(string $bytes, bool $objects = true): mixed
+    {
+        // igbinary's format starts with a zero byte; PHP's never does.
+        if (str_starts_with($bytes, "\0")) {
+            return function_exists('igbinary_unserialize') ? @igbinary_unserialize($bytes) : false;
+        }
+
+        return @unserialize($bytes, ['allowed_classes' => $objects]);
+    }
+}
+
 final class ForkedWorker
 {
     /**
@@ -36,7 +60,7 @@ final class ForkedWorker
             $payload = ['error' => get_class($error).': '.$error->getMessage()];
         }
         $stream = fopen('php://memory', 'w+');
-        fwrite($stream, serialize($payload));
+        fwrite($stream, Payload::encode($payload));
         rewind($stream);
 
         return [0, $stream];
@@ -111,7 +135,7 @@ final class ForkedWorker
         if ($job[0] > 0) {
             self::$unreaped[] = $job[0];
         }
-        $payload = $job[2] === '' ? null : unserialize($job[2]);
+        $payload = $job[2] === '' ? null : Payload::decode($job[2]);
 
         return [true, is_array($payload) ? ($payload['result'] ?? null) : null];
     }
@@ -150,7 +174,7 @@ final class ForkedWorker
             } catch (Throwable $error) {
                 $payload = ['error' => get_class($error).': '.$error->getMessage()];
             }
-            fwrite($childEnd, serialize($payload));
+            fwrite($childEnd, Payload::encode($payload));
             fclose($childEnd);
             // Skip shutdown functions and destructors inherited from the parent (an app may register its own).
             posix_kill(getmypid(), SIGKILL);
@@ -240,7 +264,7 @@ final class ForkedWorker
         if ($pid > 0) {
             self::$unreaped[] = $pid;
         }
-        $payload = $data === '' ? null : unserialize($data);
+        $payload = $data === '' ? null : Payload::decode($data);
         if (! is_array($payload)) {
             throw new RuntimeException('worker died without an answer');
         }
@@ -329,7 +353,7 @@ final class WorkerPool
                     continue;
                 }
                 $worker = array_shift($this->idle) ?? $this->spawn();
-                $message = serialize([$kind, $chunk]);
+                $message = Payload::encode([$kind, $chunk]);
                 fwrite($worker[1], pack('J', strlen($message)).$message);
                 $running[$index] = $worker;
             }
@@ -392,13 +416,13 @@ final class WorkerPool
         gc_disable();
         $started = microtime(true);
         try {
-            $task = unserialize($message);
+            $task = Payload::decode($message);
             $payload = ['result' => ($this->dispatch)(...$task)];
             profilePhase("worker: pool {$task[0]}", $started);
         } catch (Throwable $error) {
             $payload = ['error' => get_class($error).': '.$error->getMessage()];
         }
-        fwrite($stream, serialize($payload));
+        fwrite($stream, Payload::encode($payload));
         fclose($stream);
         posix_kill(getmypid(), SIGKILL);
         exit(1);

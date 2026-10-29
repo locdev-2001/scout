@@ -827,7 +827,7 @@ final class FactStore implements BackgroundWork
         $wanted = $this->seedKey();
         foreach (array_keys($candidates) as $path) {
             $data = @file_get_contents($path);
-            $saved = $data === false ? false : @unserialize((string) @gzdecode($data), ['allowed_classes' => false]);
+            $saved = $data === false ? false : Payload::decode((string) @gzdecode($data), false);
             if (is_array($saved) && ($saved['seedKey'] ?? null) === $wanted) {
                 return $saved;
             }
@@ -847,7 +847,7 @@ final class FactStore implements BackgroundWork
         $started = microtime(true);
         $data = @file_get_contents($this->savedPath());
         $seeded = $data === false;
-        $saved = $seeded ? $this->seedFacts() : @unserialize((string) @gzdecode($data), ['allowed_classes' => false]);
+        $saved = $seeded ? $this->seedFacts() : Payload::decode((string) @gzdecode($data), false);
         $unused = fn (string $reason) => profilePhase('start: saved facts not used', $started, ['reason' => $reason, 'seeded' => $seeded]);
         if (! is_array($saved)) {
             return;
@@ -935,7 +935,7 @@ final class FactStore implements BackgroundWork
             }
             @mkdir(dirname($path), 0777, true);
             // A full disk only costs the next server a slower start.
-            if (@file_put_contents("{$path}.tmp", gzencode(serialize(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
+            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
                 @rename("{$path}.tmp", $path);
             }
             profilePhase('saved facts written', $started, ['files' => count($files), 'bytes' => @filesize($path)]);
