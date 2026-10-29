@@ -161,8 +161,9 @@ function readModuleResolution(atStart = false) {
   if (viteConfig) {
     try {
       const saved = atStart ? savedBundlerConfig() : null;
+      const loadedAt = Date.now();
       const config = saved ?? JSON.parse(execFileSync(process.execPath, [driverPath, '--bundler-config', repoRoot], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 24 }));
-      if (!saved) saveBundlerConfig(config, viteConfig);
+      if (!saved) saveBundlerConfig(config, viteConfig, loadedAt);
       return {
         bundler: config.bundler,
         aliases: config.aliases,
@@ -228,8 +229,13 @@ function savedBundlerConfig() {
   }
 }
 
-function saveBundlerConfig(config, viteConfig) {
-  const inputs = [...config.inputs, viteConfig, 'package.json'];
+/** Lockfiles: a plugin updated within the range package.json allows changes only them. */
+const LOCKFILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'];
+
+/** `loadedAt`: a file the config read that changed while it was being loaded leaves the answer unsaved. */
+function saveBundlerConfig(config, viteConfig, loadedAt) {
+  const inputs = [...config.inputs, viteConfig, 'package.json', ...LOCKFILES];
+  if (inputs.some((path) => (fileStamp(path)?.[0] ?? 0) >= loadedAt - 1000)) return;
   try {
     mkdirSync(dirname(bundlerConfigPath()), { recursive: true });
     writeFileSync(bundlerConfigPath(), JSON.stringify({ key: bundlerConfigKey(inputs), inputs, config }));
