@@ -35,9 +35,19 @@ function serveDriver(array $handlers, ?BackgroundWork $background = null): void
         $write = null;
         $except = null;
         $idleWork = $background?->hasIdleWork() ?? false;
-        $ready = @stream_select($read, $write, $except, $idleWork ? 0 : null, $idleWork ? (int) (IDLE_AFTER_SECONDS * 1e6) : null);
+        // Children that finished are reaped while the driver waits, so none lingers as a zombie until the next
+        // question.
+        [$seconds, $microseconds] = match (true) {
+            $idleWork => [0, (int) (IDLE_AFTER_SECONDS * 1e6)],
+            ForkedWorker::hasUnreaped() => [1, 0],
+            default => [null, null],
+        };
+        $ready = @stream_select($read, $write, $except, $seconds, $microseconds);
         if ($ready === 0) {
-            $background->idleStep();
+            ForkedWorker::reapFinished();
+            if ($idleWork) {
+                $background->idleStep();
+            }
 
             continue;
         }

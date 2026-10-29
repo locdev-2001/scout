@@ -146,6 +146,12 @@ final class ForkedWorker
         self::$unreaped[] = $pid;
     }
 
+    /** Whether children finished or let go still wait to be reaped. */
+    public static function hasUnreaped(): bool
+    {
+        return self::$unreaped !== [];
+    }
+
     public static function reapFinished(): void
     {
         if (self::inline()) {
