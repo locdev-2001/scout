@@ -45,10 +45,13 @@ pub fn resolve_target(pool: &mut DriverPool, query: &str, position: Option<(Stri
             located.into_iter().flat_map(|answers| parse_all::<SymbolRef>(answers, pool).into_iter().take(1)).collect()
         }
         None => {
-            let resolved: Vec<SymbolRef> = {
+            let mut resolved: Vec<SymbolRef> = {
                 let answers = pool.ask("resolve", json!({ "query": query }));
                 parse_all(answers, pool)
             };
+            // A driver lists the symbols a name matches in the order it read their files, which differs between a
+            // fresh read and saved facts: the same question must get the same answer.
+            resolved.sort_by(|left, right| left.symbol.cmp(&right.symbol));
             if resolved.is_empty() && (query.contains('#') || query.contains('\\')) {
                 // `file#name` or `Namespace\\Class::method` names one symbol: if no driver has it, it does not exist
                 // (a typo, or gone).
