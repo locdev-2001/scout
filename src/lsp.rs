@@ -542,6 +542,9 @@ impl SourceLines {
     }
 }
 
+/// One semantic token of a file: (line, start, length, type, modifier bits).
+type SemanticToken = (u32, u32, u32, u32, u32);
+
 struct LspDriver {
     repo_root: PathBuf,
     config: LspConfig,
@@ -553,8 +556,7 @@ struct LspDriver {
     /// Answered `callers` symbols with what their answer read: the target's file and the names searched for.
     answered: HashMap<String, (PathBuf, Vec<String>)>,
     mentions: Mentions,
-    /// Semantic tokens per file: (line, start, length, type, modifier bits)
-    tokens: HashMap<PathBuf, Vec<(u32, u32, u32, u32, u32)>>,
+    tokens: HashMap<PathBuf, Vec<SemanticToken>>,
     primed: bool,
     /// The last answer of each `callers` question, kept while no change could alter it (or only moved lines).
     answers: HashMap<String, Value>,

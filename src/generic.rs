@@ -135,7 +135,7 @@ impl GenericIndex {
     }
 
     fn callers(&self, symbol: &str) -> Value {
-        let mut parts = symbol.rsplit(|character: char| matches!(character, ':' | '.' | '\\' | '#' | '/')).filter(|part| !part.is_empty());
+        let mut parts = symbol.rsplit([':', '.', '\\', '#', '/']).filter(|part| !part.is_empty());
         let name = parts.next().unwrap_or(symbol).to_lowercase();
         // `Orders_model::get`: a `get()` can only be that one in a file that names the class, and most likely on a
         // line that names it (`$this->orders_model->get()`). When the repository calls it that way anywhere, a
