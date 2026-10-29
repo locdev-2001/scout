@@ -817,10 +817,13 @@ final class FactStore implements BackgroundWork
             return;
         }
         $key = strtolower($facts['name']);
-        // Where the class and its methods start is not part of any caller list: moving them changes no answer.
-        $placeless = array_diff_key($facts, ['deps' => true, 'line' => true]);
-        $placeless['methods'] = array_map(fn (array $method) => array_diff_key($method, [3 => true]), $facts['methods']);
-        $facts['answerHash'] = FactExtraction::answerHash($placeless);
+        // Saved facts carry their hash. Where the class and its methods start is not part of any caller list: moving
+        // them changes no answer.
+        if (! isset($facts['answerHash'])) {
+            $placeless = array_diff_key($facts, ['deps' => true, 'line' => true]);
+            $placeless['methods'] = array_map(fn (array $method) => array_diff_key($method, [3 => true]), $facts['methods']);
+            $facts['answerHash'] = FactExtraction::answerHash($placeless);
+        }
         $facts['ancestorKeys'] = array_flip(array_map('strtolower', $facts['ancestors']));
         $this->classFacts[$key] = $facts;
         $this->remember("class:{$key}", $facts['deps']);
@@ -978,6 +981,15 @@ final class FactStore implements BackgroundWork
         foreach ($saved['files'] as $path => $facts) {
             $this->storeFile($path, $facts);
         }
+        // Classes described before a restart, unless a file they were read from changed: describing them all again
+        // is most of the CPU a start from saved facts would cost.
+        $changedFiles = array_flip($changed);
+        foreach ($saved['classes'] ?? [] as $key => $classFacts) {
+            $stale = array_filter($classFacts['deps'], fn (string $dependency) => isset($changedFiles[$dependency]) || str_starts_with($dependency, 'missing-class:')) !== [];
+            if (! $stale) {
+                $this->storeClass($key, $classFacts);
+            }
+        }
         profilePhase($seeded ? 'start: facts of another checkout read' : 'start: saved facts read', $started, ['files' => count($saved['files']), 'changed' => count($changed)]);
         // What sync() changes is saved again once the server is idle; facts taken from another checkout are saved
         // as this one's own.
@@ -1001,10 +1013,11 @@ final class FactStore implements BackgroundWork
     {
         $root = $this->files->repoRoot;
         $stored = $this->fileFacts;
+        $classes = $this->classFacts;
         $path = $this->savedPath();
         $key = $this->savedKey();
         $seedKey = $this->seedKey();
-        $job = ForkedWorker::startBackground(function () use ($root, $stored, $path, $key, $seedKey) {
+        $job = ForkedWorker::startBackground(function () use ($root, $stored, $classes, $path, $key, $seedKey) {
             $started = microtime(true);
             $files = [];
             $outside = [];
@@ -1022,7 +1035,9 @@ final class FactStore implements BackgroundWork
             }
             @mkdir(dirname($path), 0777, true);
             // A full disk only costs the next server a slower start.
-            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'outside' => $outside]), 1)) !== false) {
+            // Without what storeClass() derives again cheaply.
+            $classes = array_map(fn (array $facts) => array_diff_key($facts, ['ancestorKeys' => true]), $classes);
+            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'classes' => $classes, 'outside' => $outside]), 1)) !== false) {
                 @rename("{$path}.tmp", $path);
             }
             profilePhase('saved facts written', $started, ['files' => count($files), 'bytes' => @filesize($path)]);
