@@ -6,8 +6,9 @@
 //! the agent asked itself is noted.
 //! `finish` (Stop): before the agent ends its turn, the callers of every function changed in the session (by it or
 //! its subagents) that it has not been shown yet, once.
-//! `before-change` (PreToolUse on Edit/MultiEdit): the direct callers of each function an edit is about to change,
-//! read where its text stands in the file now, so the change is planned with them in view.
+//! `before-change` (PreToolUse on Edit/MultiEdit/Write): the direct callers of each function an edit (or a file
+//! written over) is about to change, read where its text stands in the file now, so the change is planned with
+//! them in view.
 //! `before-search` (PreToolUse on Grep/Bash): a text search for a function name also gets that function's callers.
 //! `prompt` (UserPromptSubmit): the repository's server is started again if it stopped while the session was idle,
 //! and a prompt naming code (a stack-trace line `file:line`, `Class::method`) gets the callers of what it names.
@@ -18,7 +19,7 @@
 //! failure is silent. Only `finish` makes the agent go on, for one more round, and only when a changed function has
 //! callers it has not seen.
 
-use crate::changes::{holds_code, with_session, ChangedLines, MAX_LINES_PER_FILE};
+use crate::changes::{holds_code, lines_rewritten, with_session, ChangedLines, MAX_LINES_PER_FILE};
 use crate::daemon;
 use crate::query::{QueryRequest, QueryResponse};
 use serde_json::{json, Value};
@@ -179,14 +180,21 @@ fn before_change(input: &Value) -> Option<Hint> {
         return None;
     }
     let repo = repo_root(file.parent()?)?;
+    // A file not written yet: nothing calls it.
     let relative = file.canonicalize().ok()?.strip_prefix(&repo).ok()?.to_string_lossy().into_owned();
-    let text = std::fs::read_to_string(&file).ok()?;
-    let edits: Vec<&Value> = match tool_input.get("edits").and_then(Value::as_array) {
-        Some(edits) => edits.iter().collect(),
-        None => vec![tool_input],
+    let lines = match tool_input.get("content").and_then(Value::as_str) {
+        // `Write`: the whole file again; the lines that differ are the ones it changes.
+        Some(content) => lines_rewritten(&file, content),
+        None => {
+            let text = std::fs::read_to_string(&file).ok()?;
+            let edits: Vec<&Value> = match tool_input.get("edits").and_then(Value::as_array) {
+                Some(edits) => edits.iter().collect(),
+                None => vec![tool_input],
+            };
+            let replaced = edits.iter().filter_map(|edit| Some((edit.get("old_string")?.as_str()?, edit.get("replace_all").and_then(Value::as_bool).unwrap_or(false))));
+            lines_to_change(&text, replaced)
+        }
     };
-    let replaced = edits.iter().filter_map(|edit| Some((edit.get("old_string")?.as_str()?, edit.get("replace_all").and_then(Value::as_bool).unwrap_or(false))));
-    let lines = lines_to_change(&text, replaced);
     if lines.is_empty() {
         return None;
     }
@@ -879,7 +887,7 @@ fn owned(entry: &Value) -> bool {
 /// never reach the agent that reports to the user; the parent's `Stop` covers the subagent's changes too.
 const HOOKS: [(&str, &str, &str, u64); 6] = [
     ("PreToolUse", "Grep|Bash", "before-search", 10),
-    ("PreToolUse", "Edit|MultiEdit", "before-change", 10),
+    ("PreToolUse", "Edit|MultiEdit|Write", "before-change", 10),
     ("UserPromptSubmit", "", "prompt", 10),
     ("PostToolUse", "Edit|MultiEdit|Write|Bash|mcp__scout__callers", "after-change", 10),
     ("SessionStart", "startup|resume", "session-start", 10),

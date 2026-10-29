@@ -138,8 +138,38 @@ fn uncommitted_code(repo: &Path) -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// The lines each hunk of a `git diff -U0` puts in the new file; a hunk that only removes lines gives the line
-/// the removal happened at, so the symbol around it is still asked about.
+/// The lines one side (`'-'` the old file, `'+'` the new one) of a `git diff -U0` hunk header covers; a side with
+/// no lines gives the line the change on the other side happened at, so the symbol around it is still asked about.
+fn hunk_lines(hunk: &str, side: char) -> Vec<u32> {
+    let Some(range) = hunk.split(' ').find_map(|part| part.strip_prefix(side)) else { return Vec::new() };
+    let (start, count) = match range.split_once(',') {
+        Some((start, count)) => (start.parse::<u32>().unwrap_or(1), count.parse::<u32>().unwrap_or(1)),
+        None => (range.parse::<u32>().unwrap_or(1), 1),
+    };
+    if count == 0 {
+        vec![start.max(1)]
+    } else {
+        (start..start + count).collect()
+    }
+}
+
+/// The lines of `file` that writing `content` over it changes, read from a `git diff` of the two.
+pub fn lines_rewritten(file: &Path, content: &str) -> Vec<u32> {
+    let directory = crate::daemon::cache_directory();
+    let written = directory.join(format!("rewrite-{}.tmp", std::process::id()));
+    if std::fs::create_dir_all(&directory).is_err() || std::fs::write(&written, content).is_err() {
+        return Vec::new();
+    }
+    let output = Command::new("git").args(["diff", "--no-index", "-U0", "--no-color", "--no-ext-diff", "--"]).arg(file).arg(&written).output();
+    let _ = std::fs::remove_file(&written);
+    let Ok(output) = output else { return Vec::new() };
+    let mut lines: Vec<u32> = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| line.strip_prefix("@@ ")).flat_map(|hunk| hunk_lines(hunk, '-')).collect();
+    lines.dedup();
+    lines.truncate(MAX_LINES_PER_FILE);
+    lines
+}
+
+/// The lines each hunk of a `git diff -U0` puts in the new file.
 fn changed_lines(diff: &str) -> BTreeMap<String, Vec<u32>> {
     let mut files: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     let mut file = None;
@@ -149,17 +179,7 @@ fn changed_lines(diff: &str) -> BTreeMap<String, Vec<u32>> {
             continue;
         }
         let (Some(file), Some(hunk)) = (&file, line.strip_prefix("@@ ")) else { continue };
-        let Some(added) = hunk.split(' ').find_map(|part| part.strip_prefix('+')) else { continue };
-        let (start, count) = match added.split_once(',') {
-            Some((start, count)) => (start.parse::<u32>().unwrap_or(1), count.parse::<u32>().unwrap_or(1)),
-            None => (added.parse::<u32>().unwrap_or(1), 1),
-        };
-        let lines = files.entry(file.clone()).or_default();
-        if count == 0 {
-            lines.push(start.max(1));
-        } else {
-            lines.extend(start..start + count);
-        }
+        files.entry(file.clone()).or_default().extend(hunk_lines(hunk, '+'));
     }
     for lines in files.values_mut() {
         lines.dedup();

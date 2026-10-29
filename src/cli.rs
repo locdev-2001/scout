@@ -14,7 +14,7 @@ const INSTRUCTIONS: &str = "## scout: who calls this code, what a change affects
 - scout answers one question: what calls this function, method or class, up to the entry points (routes, commands, jobs, events). It follows types, imports, inheritance and framework wiring. It is not a text search: find text, definitions, config keys and log lines with grep/rg as usual.
 - Before changing, renaming or deleting a function, method or class, run `scout callers <Class::method | name | path:line> --compact` (MCP tool `callers`). Read the `unresolved` lines too: they are calls the tool could not type, listed so none is missed.
 - For a stack-trace line, `scout locate path:line` names the function it is in.
-- The hooks bring callers without being asked: with a prompt naming a stack-trace line or `Class::method`, before an Edit (the function being edited), on a grep for a function name, after any change (edit, write, script), and at the end of a turn for changed functions not looked at yet. Check each caller still fits the change.";
+- The hooks bring callers without being asked: with a prompt naming a stack-trace line or `Class::method`, before an Edit or Write (the functions about to change), on a grep for a function name, after any change (edit, write, script), and at the end of a turn for changed functions not looked at yet. Check each caller still fits the change.";
 
 /// The skill Claude Code lists in every session, so an agent finds the tool when the task calls for it.
 const SKILL: &str = include_str!("skill.md");
