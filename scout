@@ -7,7 +7,16 @@ binary="$CARGO_TARGET_DIR/release/scout"
 if [[ ! -x "$binary" || -n "$(find "$home/src" "$home/Cargo.toml" -newer "$binary" -print -quit)" ]]; then
   if [[ "${1:-}" == hook && -x "$binary" ]]; then
     # A hook has a few seconds inside the agent's turn: it runs the binary there is, the build goes on behind it.
-    setsid cargo build --release --quiet --manifest-path "$home/Cargo.toml" </dev/null >/dev/null 2>&1 &
+    # One build at a time: every hook of every session runs here until the binary is newer than the sources.
+    # A lock left by a build that was killed is taken back after 15 minutes.
+    lock="$CARGO_TARGET_DIR/.background-build"
+    if [[ -d "$lock" && -n "$(find "$lock" -maxdepth 0 -mmin +15)" ]]; then
+      rmdir "$lock" 2>/dev/null || true
+    fi
+    if mkdir "$lock" 2>/dev/null; then
+      detach=$(command -v setsid || command -v nohup)
+      "$detach" bash -c 'cargo build --release --quiet --manifest-path "$1/Cargo.toml"; rmdir "$2"' _ "$home" "$lock" </dev/null >/dev/null 2>&1 &
+    fi
   else
     cargo build --release --quiet --manifest-path "$home/Cargo.toml" >&2
   fi
