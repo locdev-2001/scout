@@ -272,9 +272,14 @@ fn named_code(text: &str, repo: &Path) -> Vec<String> {
     let mut lines = Vec::new();
     let mut methods = Vec::new();
     let words: Vec<&str> = text.split(|character: char| character.is_whitespace() || "`'\"<>[]{},;".contains(character)).filter(|word| !word.is_empty()).collect();
+    // A pasted log repeats the same frames and paths thousands of times: each word is looked at once.
+    let mut tried = std::collections::HashSet::new();
     for (index, word) in words.iter().enumerate() {
         // Python: `File "app/x.py", line 57`: the quotes and the comma split it into `app/x.py` `line` `57`.
         let python_line = (words.get(index + 1) == Some(&"line")).then(|| words.get(index + 2)).flatten().and_then(|line| line.parse::<u32>().ok());
+        if python_line.is_none() && !tried.insert(*word) {
+            continue;
+        }
         match python_line {
             Some(line) => lines.extend(repo_file(word, repo).map(|file| format!("{file}:{line}"))),
             None => match file_line(word, repo) {
@@ -326,12 +331,15 @@ fn repo_file(path: &str, repo: &Path) -> Option<String> {
         return None;
     }
     let components: Vec<_> = path.components().filter(|part| matches!(part, std::path::Component::Normal(_))).collect();
+    // A frame in the dependencies (most lines of a pasted log) is no code of the repository: not looked for.
+    if components.iter().any(|part| ["vendor", "node_modules"].contains(&part.as_os_str().to_string_lossy().as_ref())) {
+        return None;
+    }
     let relative = match path.strip_prefix(repo) {
         Ok(inside) => inside.to_path_buf(),
         Err(_) => (0..components.len()).map(|start| components[start..].iter().collect::<PathBuf>()).find(|candidate| repo.join(candidate).is_file())?,
     };
-    let dependency = relative.components().any(|part| ["vendor", "node_modules"].contains(&part.as_os_str().to_string_lossy().as_ref()));
-    (repo.join(&relative).is_file() && !dependency).then(|| relative.to_string_lossy().into_owned())
+    repo.join(&relative).is_file().then(|| relative.to_string_lossy().into_owned())
 }
 
 /// `Class::method`, `Namespace\Class::method()` or `Class@method`: a method named with its class.
