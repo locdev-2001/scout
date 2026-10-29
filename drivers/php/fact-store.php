@@ -194,6 +194,9 @@ final class FactStore implements BackgroundWork
             return;
         }
         if ($this->idleWorkersBehind()) {
+            // What the warm-up freed goes back to the system before a worker is forked to share what is left.
+            gc_collect_cycles();
+            gc_mem_caches();
             $this->pool->renewIdle();
             $this->idleWorkersForkedAt = $this->heldFacts();
 
