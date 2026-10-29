@@ -173,7 +173,12 @@ function readModuleResolution() {
     } catch (error) {
       const lines = String(error.stderr || error.message).trim().split('\n');
       const reason = lines.find((line) => /^\w*Error\b/.test(line)) ?? lines[0];
-      warnings.push(`${viteConfig} could not be loaded (${reason}${/Cannot find module/.test(reason) ? ', dependencies not installed' : ''}); module aliases come from tsconfig/jsconfig instead`);
+      const written = writtenViteAliases(viteConfig);
+      warnings.push(`${viteConfig} could not be loaded (${reason}${/Cannot find module/.test(reason) ? ', dependencies not installed' : ''}); module aliases ${written.length ? 'are read from it as written' : 'come from tsconfig/jsconfig instead'}`);
+      if (written.length) {
+        const inputs = [...new Set([viteConfig, 'package.json', ...configFiles, ...packageFiles])];
+        return { bundler: `${viteConfig} (as written)`, aliases: written, extensions: VITE_DEFAULT_EXTENSIONS, baseUrl: null, inputs, packages, autoComponents: {}, publicDir: null, entries: [], warnings };
+      }
     }
   }
   const aliases = [];
@@ -188,6 +193,49 @@ function readModuleResolution() {
     }
   }
   return { bundler: configFiles[0] ?? 'none', aliases, extensions: VITE_DEFAULT_EXTENSIONS, baseUrl, inputs: [...new Set(['package.json', ...configFiles, ...(viteConfig ? [viteConfig] : []), ...packageFiles])], packages, autoComponents: {}, publicDir: null, entries: [], warnings };
+}
+
+/**
+ * The `resolve.alias` a Vite config writes with literal targets (`'@': '/resources/js'`, `fileURLToPath(new
+ * URL('./x', import.meta.url))`, `path.resolve(__dirname, 'x')`), read without running it: a config cannot load
+ * while its dependencies are not installed (a fresh worktree), and tsconfig/jsconfig `paths` may say something else.
+ */
+function writtenViteAliases(configFile) {
+  if (!ts) return [];
+  const absolute = join(repoRoot, configFile);
+  const directory = dirname(absolute);
+  const source = ts.createSourceFile(configFile, readFileSync(absolute, 'utf8'), ts.ScriptTarget.Latest, true);
+  const target = (node) => {
+    if (ts.isStringLiteralLike(node)) return node.text.startsWith('.') ? join(directory, node.text) : node.text;
+    if (!ts.isCallExpression(node)) return null;
+    // The strings inside, in order: the URL's or the path's parts (`__dirname` and `import.meta.url` are the config's folder).
+    const parts = [];
+    const collect = (child) => {
+      if (ts.isStringLiteralLike(child)) parts.push(child.text);
+      else ts.forEachChild(child, collect);
+    };
+    node.arguments.forEach(collect);
+    return parts.length ? join(directory, ...parts) : null;
+  };
+  const aliases = [];
+  const visit = (node) => {
+    if (ts.isPropertyAssignment(node) && propertyName(node.name) === 'alias') {
+      const value = node.initializer;
+      for (const entry of ts.isObjectLiteralExpression(value) ? value.properties : []) {
+        const replacement = ts.isPropertyAssignment(entry) ? target(entry.initializer) : null;
+        if (replacement && propertyName(entry.name)) aliases.push({ find: propertyName(entry.name), replacement });
+      }
+      for (const entry of ts.isArrayLiteralExpression(value) ? value.elements : []) {
+        if (!ts.isObjectLiteralExpression(entry)) continue;
+        const field = (name) => entry.properties.find((property) => ts.isPropertyAssignment(property) && propertyName(property.name) === name)?.initializer;
+        const replacement = field('replacement') && target(field('replacement'));
+        if (field('find') && ts.isStringLiteralLike(field('find')) && replacement) aliases.push({ find: field('find').text, replacement });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return aliases;
 }
 
 /**
