@@ -105,6 +105,9 @@ final class FactStore implements BackgroundWork
     /** @var array<string, array> lowercase class => class facts */
     private array $classFacts = [];
 
+    /** @var array<string, list<mixed>> one copy of each list of receiver types or question positions sites hold */
+    private array $sharedLists = [];
+
     /** @var array<string, string> lowercase declared class => the file declaring it */
     private array $declaringFile = [];
 
@@ -708,11 +711,26 @@ final class FactStore implements BackgroundWork
         }
     }
 
-    private function storeFile(string $path, array $fileFacts): void
+    /** The one copy of a list of receiver types or question positions that every site holding it shares. */
+    private function sharedList(array $list): array
+    {
+        return $this->sharedLists[implode("\0", $list)] ??= $list;
+    }
+
+    /** @param bool $listsShared the sites already hold shared lists (rewriting them would copy every site) */
+    private function storeFile(string $path, array $fileFacts, bool $listsShared = false): void
     {
         unset($this->unreadable[$path]);
         $byName = [];
         foreach ($fileFacts['sites'] as $site) {
+            // Receiver types and question positions repeat across most sites (15,000 distinct type lists among
+            // 290,000 sites on a large backend): every site holds the one shared copy of its list.
+            if (! $listsShared && $site[3] !== null) {
+                $site[3] = $this->sharedList($site[3]);
+            }
+            if (! $listsShared && isset($site[7])) {
+                $site[7] = $this->sharedList($site[7]);
+            }
             $byName[$site[0]][] = $site;
         }
         unset($fileFacts['sites']);
@@ -978,9 +996,21 @@ final class FactStore implements BackgroundWork
 
             return;
         }
-        foreach ($saved['files'] as $path => $facts) {
-            $this->storeFile($path, $facts);
+        // Indexes back to shared lists in place: the decoded sites are written once, never copied.
+        $lists = array_map(fn (array $list) => $this->sharedList($list), $saved['lists'] ?? []);
+        foreach ($saved['files'] as $path => &$facts) {
+            foreach ($facts['sites'] as &$site) {
+                if (is_int($site[3])) {
+                    $site[3] = $lists[$site[3]];
+                }
+                if (is_int($site[7] ?? null)) {
+                    $site[7] = $lists[$site[7]];
+                }
+            }
+            unset($site);
+            $this->storeFile($path, $facts, isset($saved['lists']));
         }
+        unset($facts);
         // Classes described before a restart, unless a file they were read from changed: describing them all again
         // is most of the CPU a start from saved facts would cost.
         $changedFiles = array_flip($changed);
@@ -1021,9 +1051,24 @@ final class FactStore implements BackgroundWork
             $started = microtime(true);
             $files = [];
             $outside = [];
+            // Shared lists are written once and named by their index, so reading the facts back makes no copies.
+            $lists = [];
+            $index = [];
+            $listed = function (array $list) use (&$lists, &$index): int {
+                return $index[implode("\0", $list)] ??= array_push($lists, $list) - 1;
+            };
             foreach ($stored as $file => $facts) {
                 // Back to the form fileFacts() returns, which storeFile() reads.
                 $facts['sites'] = $facts['byName'] === [] ? [] : array_merge(...array_values($facts['byName']));
+                foreach ($facts['sites'] as &$site) {
+                    if ($site[3] !== null) {
+                        $site[3] = $listed($site[3]);
+                    }
+                    if (isset($site[7])) {
+                        $site[7] = $listed($site[7]);
+                    }
+                }
+                unset($site);
                 $facts['mentions'] = array_keys($facts['mentions']);
                 unset($facts['byName']);
                 $files[$file] = $facts;
@@ -1037,7 +1082,7 @@ final class FactStore implements BackgroundWork
             // A full disk only costs the next server a slower start.
             // Without what storeClass() derives again cheaply.
             $classes = array_map(fn (array $facts) => array_diff_key($facts, ['ancestorKeys' => true]), $classes);
-            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'classes' => $classes, 'outside' => $outside]), 1)) !== false) {
+            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'lists' => $lists, 'classes' => $classes, 'outside' => $outside]), 1)) !== false) {
                 @rename("{$path}.tmp", $path);
             }
             profilePhase('saved facts written', $started, ['files' => count($files), 'bytes' => @filesize($path)]);
