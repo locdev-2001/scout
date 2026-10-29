@@ -1078,6 +1078,15 @@ final class FactStore implements BackgroundWork
                     }
                 }
             }
+            // Files described classes were read from that are not among the repository's PHP files (an ignored
+            // folder Composer still loads): checked at the next start like those of file facts.
+            foreach ($classes as $facts) {
+                foreach ($facts['deps'] as $dependency) {
+                    if (! isset($stored[$dependency]) && str_ends_with($dependency, '.php')) {
+                        $outside[$dependency] ??= FactExtraction::contentHash("{$root}/{$dependency}");
+                    }
+                }
+            }
             @mkdir(dirname($path), 0777, true);
             // A full disk only costs the next server a slower start.
             // Without what storeClass() derives again cheaply.
