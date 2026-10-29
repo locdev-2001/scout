@@ -49,6 +49,9 @@ final class FactStore implements BackgroundWork
     /** More files than this changed since the facts were saved (another branch): reading everything is as quick. */
     private const SAVED_CHANGES_LIMIT = 500;
 
+    /** A question no child survived answering: like a changed ancestry, its file is read again whole. */
+    private const UNANSWERED = 'ancestry|unanswered';
+
     /** Bumped whenever file facts change, so they are saved again once the server is idle. */
     private int $factsVersion = 0;
 
@@ -211,7 +214,9 @@ final class FactStore implements BackgroundWork
         } else {
             $this->changeLog[$this->changeSerial] = $contentChanged;
         }
-        $reread = array_values(array_filter($contentChanged, fn (string $path) => str_ends_with($path, '.php')));
+        // A file PHP aborted on may have depended on one just changed (a broken trait, fixed): it is read again too.
+        $this->unreadable = array_filter($this->unreadable, fn (string $path) => is_file("{$root}/{$path}"), ARRAY_FILTER_USE_KEY);
+        $reread = array_values(array_unique([...array_filter($contentChanged, fn (string $path) => str_ends_with($path, '.php')), ...array_keys($this->unreadable)]));
         $changedUnits = [];
         $wholeFiles = array_flip(array_diff($contentChanged, $reread));
         $this->reread($reread, $changedUnits, $wholeFiles);
@@ -249,7 +254,11 @@ final class FactStore implements BackgroundWork
             }
         }
         $this->reread($rereadWhole, $changedUnits, $wholeFiles);
-        $refreshedSites = $this->refreshSites($refresh);
+        $unrefreshed = [];
+        $refreshedSites = $this->refreshSites($refresh, function (array $job) use (&$unrefreshed) {
+            $unrefreshed[] = $job[0];
+        });
+        $this->reread($unrefreshed, $changedUnits, $wholeFiles);
         profilePhase('sync: refresh stale facts', $phaseStarted, ['wholeFiles' => count($rereadWhole), 'sites' => $refreshedSites]);
 
         $phaseStarted = microtime(true);
@@ -445,10 +454,13 @@ final class FactStore implements BackgroundWork
             }
         }
         $answers = [];
+        $unanswered = [];
         if ($toAsk !== []) {
             $chunkSize = (int) ceil(count($toAsk) / $this->parallelism);
-            $chunks = $this->pool->map('answers', array_keys($toAsk), $chunkSize);
-            $answers = array_merge(...$chunks);
+            $chunks = $this->mapSurviving('answers', array_keys($toAsk), $chunkSize, function (string $question) use (&$unanswered) {
+                $unanswered[$question] = true;
+            });
+            $answers = $chunks === [] ? [] : array_merge(...$chunks);
         }
 
         $stale = [];
@@ -456,6 +468,9 @@ final class FactStore implements BackgroundWork
             $questions = $this->fileFacts[$path]['questions'] ?? [];
             $changed = [];
             foreach ($questions as $position => [$question, $hash]) {
+                if (isset($unanswered[$question])) {
+                    $changed[self::UNANSWERED] = true;
+                }
                 if (! isset($answers[$question])) {
                     continue;
                 }
@@ -499,8 +514,9 @@ final class FactStore implements BackgroundWork
      * drops the cached caller lists those sites can alter.
      *
      * @param  array<string, array<string, true>>  $changedQuestions  path => questions whose answer changed
+     * @param  callable(array, string): void  $lost  hears of each [path, sites] no child survived refreshing
      */
-    private function refreshSites(array $changedQuestions): int
+    private function refreshSites(array $changedQuestions, callable $lost): int
     {
         $requests = [];
         foreach ($changedQuestions as $path => $questions) {
@@ -522,9 +538,9 @@ final class FactStore implements BackgroundWork
             return 0;
         }
         $jobs = array_map(null, array_keys($requests), array_values($requests));
-        $results = $this->pool->map('refresh', $jobs, (int) ceil(count($jobs) / $this->parallelism));
+        $results = $this->mapSurviving('refresh', $jobs, (int) ceil(count($jobs) / $this->parallelism), $lost);
         $count = 0;
-        foreach (array_merge(...$results) as $path => $refreshed) {
+        foreach ($results === [] ? [] : array_merge(...$results) as $path => $refreshed) {
             $count += count($refreshed);
             $this->applyRefreshedSites($path, $refreshed);
         }
@@ -627,19 +643,9 @@ final class FactStore implements BackgroundWork
         }
         $missing = array_map(fn (string $path) => [$path, $previous[$path] ?? null, $changedPaths], $missing);
         $chunkSize = min(self::FILES_PER_WORKER, (int) ceil(count($missing) / $this->parallelism));
-        try {
-            $chunks = $this->pool->map('files', $missing, $chunkSize);
-        } catch (RuntimeException) {
-            // A child died (PHP can abort on a broken class): read one file per child to find which.
-            $chunks = [];
-            foreach ($missing as $item) {
-                try {
-                    $chunks[] = $this->pool->map('files', [$item], 1)[0];
-                } catch (RuntimeException $error) {
-                    $this->unreadable[$item[0]] = $error->getMessage();
-                }
-            }
-        }
+        $chunks = $this->mapSurviving('files', $missing, $chunkSize, function (array $item, string $error) {
+            $this->unreadable[$item[0]] = $error;
+        });
         foreach ($chunks as $facts) {
             foreach ($facts as $path => $fileFacts) {
                 if ($fileFacts !== null) {
@@ -649,8 +655,35 @@ final class FactStore implements BackgroundWork
         }
     }
 
+    /**
+     * The pool's results for $items, a chunk per child, as WorkerPool::map() returns them. PHP aborts on some broken
+     * classes: when a child dies, each item is asked again in a child of its own, and $lost hears of every item no
+     * child survived, so a broken file costs only what depends on it and never the driver.
+     *
+     * @param  callable(mixed, string): void  $lost
+     * @return list<mixed>
+     */
+    private function mapSurviving(string $kind, array $items, int $chunkSize, callable $lost): array
+    {
+        try {
+            return $this->pool->map($kind, $items, $chunkSize);
+        } catch (RuntimeException) {
+            $chunks = [];
+            foreach ($items as $item) {
+                try {
+                    $chunks[] = $this->pool->map($kind, [$item], 1)[0];
+                } catch (RuntimeException $error) {
+                    $lost($item, $error->getMessage());
+                }
+            }
+
+            return $chunks;
+        }
+    }
+
     private function storeFile(string $path, array $fileFacts): void
     {
+        unset($this->unreadable[$path]);
         $byName = [];
         foreach ($fileFacts['sites'] as $site) {
             $byName[$site[0]][] = $site;
@@ -714,11 +747,18 @@ final class FactStore implements BackgroundWork
             return;
         }
         $started = microtime(true);
-        $chunks = $this->pool->map('classes', array_values($missing), (int) ceil(count($missing) / $this->parallelism));
+        // A class no child survived describing is unknown, like one that does not exist.
+        $lost = [];
+        $chunks = $this->mapSurviving('classes', array_values($missing), (int) ceil(count($missing) / $this->parallelism), function (string $class) use (&$lost) {
+            $lost[strtolower($class)] = true;
+        });
         profilePhase('classes: fetched', $started, ['count' => count($missing)]);
-        $requested = array_keys($missing);
-        foreach (array_merge(...$chunks) as $index => $facts) {
+        $requested = array_keys(array_diff_key($missing, $lost));
+        foreach ($chunks === [] ? [] : array_merge(...$chunks) as $index => $facts) {
             $this->storeClass($requested[$index], $facts);
+        }
+        foreach (array_keys($lost) as $class) {
+            $this->storeClass($class, null);
         }
     }
 
