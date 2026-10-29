@@ -14,7 +14,7 @@ const KEPT_FOR: Duration = Duration::from_secs(7 * 86_400);
 /// A file larger than this is no source code worth fingerprinting.
 const MAX_FILE_BYTES: u64 = 2 << 20;
 /// Changed lines located per file at most: a whole rewritten file says which functions changed long before this.
-const MAX_LINES_PER_FILE: usize = 400;
+pub const MAX_LINES_PER_FILE: usize = 400;
 /// How long a hook waits for another hook of the same session (parallel tool calls) to put the record back.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 /// A lock older than this was left by a hook that died.

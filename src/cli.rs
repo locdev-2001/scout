@@ -205,13 +205,13 @@ pub fn status() -> Result<u8, String> {
             mcp_scopes.push("project .mcp.json");
         }
     }
-    // Every setup installed the search hook; only the current one installs the end-of-turn hook.
+    // Every setup installed the search hook; only the current one installs the hook before an edit.
     let (mut hook_scopes, mut current_hooks) = (Vec::new(), true);
     let settings_files = [("user", home.join(".claude/settings.json"))].into_iter().chain(repo.iter().flat_map(|repo| [".claude/settings.json", ".claude/settings.local.json"].map(|settings| (settings, repo.join(settings)))));
     for (scope, settings) in settings_files {
         if contains(settings.clone(), " hook before-search") {
             hook_scopes.push(scope);
-            current_hooks &= contains(settings, " hook finish");
+            current_hooks &= contains(settings, " hook before-change");
         }
     }
     let scopes = |found: Vec<&str>, yes: &str, no: &str| if found.is_empty() { no.to_owned() } else { format!("{yes} ({})", found.join(", ")) };

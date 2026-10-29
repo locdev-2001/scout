@@ -6,7 +6,11 @@
 //! the agent asked itself is noted.
 //! `finish` (Stop): before the agent ends its turn, the callers of every function changed in the session (by it or
 //! its subagents) that it has not been shown yet, once.
+//! `before-change` (PreToolUse on Edit/MultiEdit): the direct callers of each function an edit is about to change,
+//! read where its text stands in the file now, so the change is planned with them in view.
 //! `before-search` (PreToolUse on Grep/Bash): a text search for a function name also gets that function's callers.
+//! `prompt` (UserPromptSubmit): the repository's server is started again if it stopped while the session was idle,
+//! and a prompt naming code (a stack-trace line `file:line`, `Class::method`) gets the callers of what it names.
 //! `session-start` (SessionStart): the server of the session's repository starts reading the code, so the first
 //! searches find it ready, and the session's changes are measured from here.
 //!
@@ -14,7 +18,7 @@
 //! failure is silent. Only `finish` makes the agent go on, for one more round, and only when a changed function has
 //! callers it has not seen.
 
-use crate::changes::{holds_code, with_session, ChangedLines};
+use crate::changes::{holds_code, with_session, ChangedLines, MAX_LINES_PER_FILE};
 use crate::daemon;
 use crate::query::{QueryRequest, QueryResponse};
 use serde_json::{json, Value};
@@ -104,21 +108,42 @@ pub fn run(event: &str, dry_run: bool) -> u8 {
             None
         }
         "before-search" => before_search(&input),
+        "before-change" => before_change(&input),
+        "prompt" => prompt(&input),
         "session-start" => session_start(&input),
         _ => None,
     };
-    if let Some(context) = context {
+    if let Some(hint) = context {
         let event_name = input.get("hook_event_name").and_then(Value::as_str).unwrap_or("PostToolUse");
-        println!("{}", json!({ "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": context } }));
+        println!("{}", json!({ "systemMessage": hint.notice(), "hookSpecificOutput": { "hookEventName": event_name, "additionalContext": hint.context } }));
     }
     0
+}
+
+/// What a hook adds: the text for the agent, and the symbols it covers, named in one line the user sees so the work
+/// done for the agent is not invisible.
+struct Hint {
+    context: String,
+    symbols: Vec<String>,
+}
+
+impl Hint {
+    fn notice(&self) -> String {
+        const NAMED: usize = 3;
+        let mut named: Vec<&str> = self.symbols.iter().take(NAMED).map(String::as_str).collect();
+        let more = format!("+{} more", self.symbols.len().saturating_sub(NAMED));
+        if self.symbols.len() > NAMED {
+            named.push(&more);
+        }
+        format!("scout: callers of {} given to Claude", named.join(", "))
+    }
 }
 
 fn session_id(input: &Value) -> &str {
     input.get("session_id").and_then(Value::as_str).unwrap_or_default()
 }
 
-fn session_start(input: &Value) -> Option<String> {
+fn session_start(input: &Value) -> Option<Hint> {
     let cwd = PathBuf::from(input.get("cwd")?.as_str()?);
     let repo = repo_root(&cwd)?;
     crate::changes::forget_old_sessions();
@@ -140,10 +165,160 @@ fn asked_callers(tool: &str, tool_input: &Value) -> Vec<String> {
     }
 }
 
+/// Before an edit lands: the direct callers of each function its `old_string`s sit in, read where they stand in the
+/// file now, so the change is made knowing what depends on it. What is shown here is not shown again after it.
+fn before_change(input: &Value) -> Option<Hint> {
+    let started = Instant::now();
+    let tool_input = input.get("tool_input")?;
+    let cwd = PathBuf::from(input.get("cwd").and_then(Value::as_str).unwrap_or("."));
+    let file = cwd.join(tool_input.get("file_path")?.as_str()?);
+    if !holds_code(&file) {
+        return None;
+    }
+    let repo = repo_root(file.parent()?)?;
+    let relative = file.canonicalize().ok()?.strip_prefix(&repo).ok()?.to_string_lossy().into_owned();
+    let text = std::fs::read_to_string(&file).ok()?;
+    let edits: Vec<&Value> = match tool_input.get("edits").and_then(Value::as_array) {
+        Some(edits) => edits.iter().collect(),
+        None => vec![tool_input],
+    };
+    let replaced = edits.iter().filter_map(|edit| Some((edit.get("old_string")?.as_str()?, edit.get("replace_all").and_then(Value::as_bool).unwrap_or(false))));
+    let lines = lines_to_change(&text, replaced);
+    if lines.is_empty() {
+        return None;
+    }
+    let id = session_id(input);
+    // Followed from before the edit, so the edit is measured as this session's change once it lands.
+    with_session(id, |session| session.follow(&repo));
+    // A server not running is started: a repository it saved the analysis of answers within the budget, a
+    // larger warm-up goes on for the next edit, the edit never waits longer.
+    let deadline = started + SEARCH_BUDGET;
+    let symbols = match changed_symbols(&repo, vec![ChangedLines { repo: repo.clone(), file: relative, lines }], deadline, true) {
+        Ok(symbols) => symbols,
+        Err(outcome) => {
+            record("before-change", &repo, &[], outcome, started);
+            return None;
+        }
+    };
+    let unshown: Vec<String> = with_session(id, |session| symbols.into_iter().filter(|symbol| !session.was_shown(symbol)).take(MAX_PLACES).collect()).unwrap_or_default();
+    if unshown.is_empty() {
+        return None;
+    }
+    let callers = ask(&repo, unshown.clone(), deadline, true);
+    with_session(id, |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
+    record("before-change", &repo, &unshown, callers.outcome(), started);
+    let answers = callers.text(MAX_LINES)?;
+    Some(Hint { context: format!("scout: who calls the code this edit changes (keep each caller working, or change it too):\n{answers}"), symbols: callers.useful })
+}
+
+/// Occurrences of one old string an edit looks at, at most: `replace_all` on a common word must stay cheap.
+const MAX_REPLACED: usize = 50;
+
+/// The lines of `text` (from 1) that replacing these strings changes: every occurrence of an old string when all
+/// are replaced, else the first. An old string an earlier edit of the same call puts in is not in `text`: skipped.
+fn lines_to_change<'a>(text: &str, replaced: impl Iterator<Item = (&'a str, bool)>) -> Vec<u32> {
+    let mut lines = std::collections::BTreeSet::new();
+    for (old, all) in replaced.filter(|(old, _)| !old.trim().is_empty()) {
+        let mut line = 1;
+        let mut counted_to = 0;
+        for (offset, _) in text.match_indices(old).take(if all { MAX_REPLACED } else { 1 }) {
+            line += text[counted_to..offset].matches('\n').count() as u32;
+            counted_to = offset;
+            let last = line + old.trim_end_matches('\n').matches('\n').count() as u32;
+            lines.extend(line..=last);
+        }
+    }
+    lines.into_iter().take(MAX_LINES_PER_FILE).collect()
+}
+
+/// Code a prompt names, asked about at most: a pasted stack trace names many frames, the first ones matter.
+const MAX_PROMPT_TARGETS: usize = 3;
+
+/// When the user writes: the repository's server is started again if it stopped while the session was idle, and
+/// code the prompt names gets its callers, a stack-trace line (`app/Foo.php:57`, `Foo.php(57)`, Python's
+/// `File "x.py", line 57`) or a `Class::method`.
+fn prompt(input: &Value) -> Option<Hint> {
+    let started = Instant::now();
+    let cwd = PathBuf::from(input.get("cwd")?.as_str()?);
+    let repo = repo_root(&cwd)?;
+    let targets = named_code(input.get("prompt")?.as_str()?, &repo);
+    if targets.is_empty() {
+        let _ = daemon::ensure_running(&repo);
+        return None;
+    }
+    let callers = ask(&repo, targets.clone(), started + SEARCH_BUDGET, true);
+    record("prompt", &repo, &targets, callers.outcome(), started);
+    with_session(session_id(input), |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
+    let answers = callers.text(MAX_LINES)?;
+    Some(Hint { context: format!("scout: who calls the code this prompt names (exact, with entry points; unresolved lines are listed for reading):\n{answers}"), symbols: callers.useful })
+}
+
+/// What a prompt names in the repository, in order and each once: `file:line` for a line of a code file there (a
+/// path from another machine is matched by its end), `Class::method` (or Laravel's `Class@method`) for a method.
+fn named_code(text: &str, repo: &Path) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    let words: Vec<&str> = text.split(|character: char| character.is_whitespace() || "`'\"<>[]{},;".contains(character)).filter(|word| !word.is_empty()).collect();
+    for (index, word) in words.iter().enumerate() {
+        // Python: `File "app/x.py", line 57`: the quotes and the comma split it into `app/x.py` `line` `57`.
+        let python_line = (words.get(index + 1) == Some(&"line")).then(|| words.get(index + 2)).flatten().and_then(|line| line.parse::<u32>().ok());
+        let target = match python_line {
+            Some(line) => repo_file(word, repo).map(|file| format!("{file}:{line}")),
+            None => file_line(word, repo).or_else(|| method_name(word)),
+        };
+        if let Some(target) = target.filter(|target| !targets.contains(target)) {
+            targets.push(target);
+            if targets.len() == MAX_PROMPT_TARGETS {
+                break;
+            }
+        }
+    }
+    targets
+}
+
+/// `path:line`, `path:line:column` or `path(line)` (PHP traces), from inside a frame's parentheses too.
+fn file_line(word: &str, repo: &Path) -> Option<String> {
+    let word = word.trim_start_matches('(').trim_end_matches([')', ':', '.']);
+    let (path, line) = match word.split_once('(') {
+        Some((path, line)) => (path, line.trim_end_matches(')')),
+        None => {
+            let mut parts = word.splitn(3, ':');
+            (parts.next()?, parts.next()?)
+        }
+    };
+    let line: u32 = line.parse().ok().filter(|line| *line > 0)?;
+    Some(format!("{}:{line}", repo_file(path, repo)?))
+}
+
+/// A code file of the repository the path names, relative to it: as written, or (a path on another machine, such
+/// as a server's `/var/www/app/...`) by the longest end of it that exists here. Dependencies are not the code asked
+/// about.
+fn repo_file(path: &str, repo: &Path) -> Option<String> {
+    let path = Path::new(path.strip_prefix("file://").unwrap_or(path));
+    if path.extension().is_none() || !holds_code(path) {
+        return None;
+    }
+    let components: Vec<_> = path.components().filter(|part| matches!(part, std::path::Component::Normal(_))).collect();
+    let relative = match path.strip_prefix(repo) {
+        Ok(inside) => inside.to_path_buf(),
+        Err(_) => (0..components.len()).map(|start| components[start..].iter().collect::<PathBuf>()).find(|candidate| repo.join(candidate).is_file())?,
+    };
+    let dependency = relative.components().any(|part| ["vendor", "node_modules"].contains(&part.as_os_str().to_string_lossy().as_ref()));
+    (repo.join(&relative).is_file() && !dependency).then(|| relative.to_string_lossy().into_owned())
+}
+
+/// `Class::method`, `Namespace\Class::method()` or `Class@method`: a method named with its class.
+fn method_name(word: &str) -> Option<String> {
+    let word = word.trim_end_matches(['(', ')', '.', ':']).replace('@', "::");
+    let (class, method) = word.rsplit_once("::")?;
+    let class = class.trim_start_matches('\\');
+    let is_name = |text: &str| text.chars().next().is_some_and(|first| first.is_ascii_alphabetic() || first == '_') && text.chars().all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '\\');
+    (is_name(class) && is_name(method) && !method.contains('\\') && method.len() >= 2).then(|| format!("{class}::{method}"))
+}
+
 /// What the tool call changed in the code, found in the repositories rather than in the call: an edit, a written
 /// file and a shell script that rewrites one all count. The callers of the functions it changed that the agent has
 /// not been shown yet are added.
-fn after_change(input: &Value) -> Option<String> {
+fn after_change(input: &Value) -> Option<Hint> {
     let tool = input.get("tool_name")?.as_str()?;
     let tool_input = input.get("tool_input")?;
     let cwd = PathBuf::from(input.get("cwd").and_then(Value::as_str).unwrap_or("."));
@@ -176,8 +351,9 @@ fn after_change(input: &Value) -> Option<String> {
     let started = Instant::now();
     let deadline = started + BUDGET;
     let mut added = Vec::new();
+    let mut covered = Vec::new();
     for (repo, places) in by_repository(changed) {
-        let symbols = match changed_symbols(&repo, places, deadline) {
+        let symbols = match changed_symbols(&repo, places, deadline, true) {
             Ok(symbols) => symbols,
             Err(outcome) => {
                 record("after-change", &repo, &[], outcome, started);
@@ -192,13 +368,14 @@ fn after_change(input: &Value) -> Option<String> {
         with_session(id, |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
         record("after-change", &repo, &unshown, callers.outcome(), started);
         added.extend(callers.text(MAX_LINES));
+        covered.extend(callers.useful);
     }
-    (!added.is_empty()).then(|| format!("scout: direct callers of the code just changed (check they still fit the change):\n{}", added.join("\n")))
+    (!added.is_empty()).then(|| Hint { context: format!("scout: direct callers of the code just changed (check they still fit the change):\n{}", added.join("\n")), symbols: covered })
 }
 
 /// Before the agent ends its turn: the callers of every function the session changed that it was not shown yet,
 /// once. Asked again after this, the agent may stop.
-fn finish(input: &Value) -> Option<String> {
+fn finish(input: &Value) -> Option<Hint> {
     if input.get("stop_hook_active").and_then(Value::as_bool) == Some(true) {
         return None;
     }
@@ -207,9 +384,10 @@ fn finish(input: &Value) -> Option<String> {
     let started = Instant::now();
     let deadline = started + FINISH_BUDGET;
     let mut reminders = Vec::new();
+    let mut covered = Vec::new();
     let mut not_fetched = Vec::new();
     for (repo, places) in by_repository(changed) {
-        let symbols = match changed_symbols(&repo, places, deadline) {
+        let symbols = match changed_symbols(&repo, places, deadline, true) {
             Ok(symbols) => symbols,
             Err(outcome) => {
                 record("finish", &repo, &[], outcome, started);
@@ -232,6 +410,7 @@ fn finish(input: &Value) -> Option<String> {
         };
         record("finish", &repo, &unshown, outcome, started);
         reminders.extend(callers.text(MAX_FINISH_LINES));
+        covered.extend(callers.useful);
         not_fetched.extend(missed);
     }
     if reminders.is_empty() && not_fetched.is_empty() {
@@ -245,7 +424,8 @@ fn finish(input: &Value) -> Option<String> {
     if !not_fetched.is_empty() {
         text.push_str(&format!("\nAlso changed, callers not fetched in time (run `scout callers <symbol> --compact`): {}", not_fetched.join(", ")));
     }
-    Some(text)
+    covered.extend(not_fetched);
+    Some(Hint { context: text, symbols: covered })
 }
 
 fn by_repository(changed: Vec<ChangedLines>) -> std::collections::BTreeMap<PathBuf, Vec<ChangedLines>> {
@@ -258,10 +438,11 @@ fn by_repository(changed: Vec<ChangedLines>) -> std::collections::BTreeMap<PathB
 
 /// The functions (and classes) around changed lines, each once; a change outside any (an import, a file-level
 /// statement) names none.
-fn changed_symbols(repo: &Path, places: Vec<ChangedLines>, deadline: Instant) -> Result<Vec<String>, Outcome> {
+/// `start` lets the question start the repository's server.
+fn changed_symbols(repo: &Path, places: Vec<ChangedLines>, deadline: Instant, start: bool) -> Result<Vec<String>, Outcome> {
     let files: Vec<String> = places.iter().map(|place| place.file.clone()).collect();
     let questions = places.into_iter().map(|place| format!("{}:{}", place.file, place.lines.iter().map(u32::to_string).collect::<Vec<_>>().join(","))).collect();
-    let replies = replies_within(repo, "locate", questions, deadline, true);
+    let replies = replies_within(repo, "locate", questions, deadline, start);
     if replies.answered.is_empty() {
         return Err(if replies.timed_out { Outcome::Timeout } else { Outcome::NotRunning });
     }
@@ -316,7 +497,7 @@ fn planned_search(input: &Value) -> Option<Result<PlannedSearch, Outcome>> {
     })
 }
 
-fn before_search(input: &Value) -> Option<String> {
+fn before_search(input: &Value) -> Option<Hint> {
     let started = Instant::now();
     let PlannedSearch { repo, names } = match planned_search(input)? {
         Ok(search) => search,
@@ -336,7 +517,7 @@ fn before_search(input: &Value) -> Option<String> {
     with_session(session_id(input), |session| session.mark_shown(callers.answered.iter().map(String::as_str)));
     let answers = callers.text(MAX_LINES)?;
     let listed = names.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
-    Some(format!("scout: who calls {listed} (exact, with entry points; unresolved lines are listed for reading, never dropped). For callers, `scout callers` answers more completely than a text search:\n{answers}"))
+    Some(Hint { context: format!("scout: who calls {listed} (exact, with entry points; unresolved lines are listed for reading, never dropped). For callers, `scout callers` answers more completely than a text search:\n{answers}"), symbols: callers.useful })
 }
 
 /// The branches of an alternation (`a\|b` in grep, `a|b` in rg and `grep -E`), each a search of its own.
@@ -545,6 +726,8 @@ fn replies_within(repo: &Path, command: &str, questions: Vec<String>, deadline: 
 struct Callers {
     lines: Vec<String>,
     answered: Vec<String>,
+    /// The questions whose answers are among `lines`.
+    useful: Vec<String>,
     timed_out: bool,
 }
 
@@ -577,16 +760,21 @@ impl Callers {
 /// Direct callers of each question, all before one deadline.
 fn ask(repo: &Path, questions: Vec<String>, deadline: Instant, start: bool) -> Callers {
     let replies = replies_within(repo, "callers", questions, deadline, start);
-    let mut callers = Callers { lines: Vec::new(), answered: Vec::new(), timed_out: replies.timed_out };
+    let mut callers = Callers { lines: Vec::new(), answered: Vec::new(), useful: Vec::new(), timed_out: replies.timed_out };
     for (question, response) in replies.answered {
-        callers.answered.push(question);
+        callers.answered.push(question.clone());
         // A file-level symbol, one nobody calls, or calls found by name alone (what the search itself prints)
         // add nothing worth the context. A name may stand for several symbols, each with its own total.
         let mut totals = response.stdout.lines().filter(|line| line.starts_with("Total:")).peekable();
         let by_name_only = totals.peek().is_some() && totals.all(|line| line.starts_with("Total: 0 exact, 0 likely"));
         let useful = response.exit_code == 0 && !by_name_only && response.stdout.lines().any(|line| line.starts_with("- ")) && !response.stdout.contains("(file)");
         if useful {
-            callers.lines.extend(response.stdout.lines().filter(|line| !line.trim().is_empty()).map(str::to_owned));
+            // The symbol a `file:line` question stood for, named by the answer's first line.
+            let symbol = response.stdout.lines().next().and_then(|line| line.split("  ").next()).filter(|_| question.contains(':') && !question.contains("::"));
+            callers.useful.push(symbol.map_or(question, str::to_owned));
+            // Hooks ask for direct callers only: the lines saying deeper ones were cut tell the agent nothing.
+            let worth_reading = |line: &&str| !line.trim().is_empty() && !line.starts_with("… (stopped") && !line.starts_with("Some branches were cut");
+            callers.lines.extend(response.stdout.lines().filter(worth_reading).map(str::to_owned));
         }
     }
     callers
@@ -667,15 +855,17 @@ fn civil_date(days: u64) -> String {
 
 /// Hook entries this tool owns in Claude Code's settings, recognized by their command.
 fn owned(entry: &Value) -> bool {
-    let modes = [" hook after-edit", " hook after-change", " hook finish", " hook before-search", " hook session-start"];
+    let modes = [" hook after-edit", " hook after-change", " hook finish", " hook before-search", " hook before-change", " hook prompt", " hook session-start"];
     entry.get("hooks").and_then(Value::as_array).into_iter().flatten().any(|hook| hook.get("command").and_then(Value::as_str).is_some_and(|command| modes.iter().any(|mode| command.contains(mode))))
 }
 
 /// Each hook: its event, the tools it runs for (none: every time), its mode, and its time limit in seconds.
 /// No `SubagentStop`: a subagent's hooks carry its parent's session, so a reminder there would be marked shown and
 /// never reach the agent that reports to the user; the parent's `Stop` covers the subagent's changes too.
-const HOOKS: [(&str, &str, &str, u64); 4] = [
+const HOOKS: [(&str, &str, &str, u64); 6] = [
     ("PreToolUse", "Grep|Bash", "before-search", 10),
+    ("PreToolUse", "Edit|MultiEdit", "before-change", 10),
+    ("UserPromptSubmit", "", "prompt", 10),
     ("PostToolUse", "Edit|MultiEdit|Write|Bash|mcp__scout__callers", "after-change", 10),
     ("SessionStart", "startup|resume", "session-start", 10),
     ("Stop", "", "finish", 30),

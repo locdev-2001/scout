@@ -40,7 +40,8 @@ const USAGE: &str = "Usage:
   scout logs [repo]                        the end of the servers' logs
   scout update                             pull the tool's repository, rebuild, set up again
   scout --version
-  scout hook after-edit|before-search|session-start  Claude Code hook (reads the hook's JSON on stdin)
+  scout hook before-change|after-change|before-search|prompt|finish|session-start
+                                           Claude Code hook (reads the hook's JSON on stdin)
   scout claude-hooks install|remove        add or remove those hooks in ~/.claude/settings.json
   scout hold-slot                          for drivers: wait for a machine-wide work slot, hold it until stdin closes
                                                (SCOUT_MAX_WORKERS slots, default half the cores, 0 = no limit;
