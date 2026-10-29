@@ -32,8 +32,11 @@ const requireFromRepo = createRequire(join(repoRoot, 'package.json'));
 /** The parsers installed with this tool (`scout setup`), for a repository that has none of its own. */
 const requireBundled = createRequire(join(dirname(fileURLToPath(import.meta.url)), 'package.json'));
 const ts = loadFromRepo('typescript');
-const vue = loadFromRepo('vue/compiler-sfc');
-const svelte = loadFromRepo('svelte/compiler');
+/** Vue's and Svelte's compilers are loaded the first time a component is read: most repositories have neither. */
+let vueCompiler;
+let svelteCompiler;
+const vue = () => (vueCompiler ??= { module: loadFromRepo('vue/compiler-sfc') }).module;
+const svelte = () => (svelteCompiler ??= { module: loadFromRepo('svelte/compiler') }).module;
 const SCRIPT_EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.vue', '.svelte', '.mdx']);
 const VITE_DEFAULT_EXTENSIONS = ['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.json'];
 const TEST_PATH = /(^|\/)(tests?|__tests__|e2e)\/|\.(test|spec)\.[cm]?[jt]sx?$/;
@@ -667,11 +670,11 @@ class FileReader {
     if (this.facts.path.endsWith('.svelte')) return this.svelteScriptBlocks();
     if (this.facts.path.endsWith('.mdx')) return [{ code: mdxAsTsx(this.text), line: 1, lang: 'tsx', setup: false }];
     if (!this.facts.isComponent) return [{ code: this.text, line: 1, lang: extname(this.facts.path).slice(1).replace(/^[mc](?=ts|js)/, ''), setup: false }];
-    if (!vue) {
+    if (!vue()) {
       this.facts.warnings.push(`vue/compiler-sfc is not installed; ${this.facts.path} was not analysed`);
       return [];
     }
-    const { descriptor, errors } = vue.parse(this.text, { filename: this.facts.path });
+    const { descriptor, errors } = vue().parse(this.text, { filename: this.facts.path });
     if (errors.length) this.facts.warnings.push(`${this.facts.path}: ${String(errors[0].message ?? errors[0])}`);
     this.template = descriptor.template?.ast ?? null;
     this.indexLines();
@@ -681,11 +684,11 @@ class FileReader {
 
   /** `<script module>` and the instance `<script>` of a Svelte component; the markup is read afterwards. */
   svelteScriptBlocks() {
-    if (!svelte) {
+    if (!svelte()) {
       this.facts.warnings.push(`svelte/compiler is not installed; ${this.facts.path} was not analysed`);
       return [];
     }
-    const ast = svelte.parse(this.text, { modern: true });
+    const ast = svelte().parse(this.text, { modern: true });
     this.svelteTemplate = ast.fragment;
     this.indexLines();
     return [ast.module, ast.instance].filter(Boolean).map((script) => ({
@@ -2096,7 +2099,7 @@ function serveDriver() {
     probe: () => ({
       driver: 'javascript',
       typescript: ts?.version ?? null,
-      vueCompiler: Boolean(vue),
+      vueCompiler: Boolean(vue()),
       moduleResolution: resolution.bundler,
       files: known.size,
       filesRead: store?.files.size ?? 0,
