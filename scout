@@ -14,8 +14,8 @@ if [[ ! -x "$binary" || -n "$(find "$home/src" "$home/Cargo.toml" -newer "$binar
       rmdir "$lock" 2>/dev/null || true
     fi
     if mkdir "$lock" 2>/dev/null; then
-      detach=$(command -v setsid || command -v nohup)
-      "$detach" bash -c 'cargo build --release --quiet --manifest-path "$1/Cargo.toml"; rmdir "$2"' _ "$home" "$lock" </dev/null >/dev/null 2>&1 &
+      detach=$(command -v setsid || command -v nohup || true)
+      $detach bash -c 'cargo build --release --quiet --manifest-path "$1/Cargo.toml"; rmdir "$2"' _ "$home" "$lock" </dev/null >/dev/null 2>&1 &
     fi
   else
     cargo build --release --quiet --manifest-path "$home/Cargo.toml" >&2
