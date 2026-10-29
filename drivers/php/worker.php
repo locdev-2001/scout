@@ -140,6 +140,12 @@ final class ForkedWorker
         return [true, is_array($payload) ? ($payload['result'] ?? null) : null];
     }
 
+    /** A child let go without being waited for: reaped with the finished ones. */
+    public static function released(int $pid): void
+    {
+        self::$unreaped[] = $pid;
+    }
+
     public static function reapFinished(): void
     {
         if (self::inline()) {
@@ -325,6 +331,20 @@ final class WorkerPool
     public function needsWorkers(): bool
     {
         return ! ForkedWorker::inline() && count($this->idle) < min($this->size, self::IDLE_WORKERS);
+    }
+
+    /**
+     * Lets the idle workers go (each reads the end of its stream and exits), so the next ones fork from the driver
+     * as it is now: one forked during the warm-up keeps its own copy of every page the driver wrote since, which
+     * grows to most of the driver's memory while it waits.
+     */
+    public function renewIdle(): void
+    {
+        foreach ($this->idle as [$pid, $stream]) {
+            fclose($stream);
+            ForkedWorker::released($pid);
+        }
+        $this->idle = [];
     }
 
     /** Reaps finished children and forks one idle worker; called only while no request is waiting. */

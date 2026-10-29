@@ -156,7 +156,21 @@ final class FactStore implements BackgroundWork
 
     public function hasIdleWork(): bool
     {
-        return $this->pool->needsWorkers() || $this->saveDue() || $this->recomputeQueue !== [];
+        return $this->pool->needsWorkers() || $this->saveDue() || $this->idleWorkersBehind() || $this->recomputeQueue !== [];
+    }
+
+    /** What the driver held when the idle workers were forked: file facts version and classes described. */
+    private string $idleWorkersForkedAt = '';
+
+    private function heldFacts(): string
+    {
+        return $this->factsVersion.'/'.count($this->classFacts);
+    }
+
+    /** Facts changed since the idle workers were forked, once the warm-up is over (it changes them all the time). */
+    private function idleWorkersBehind(): bool
+    {
+        return $this->allExtracted && $this->warmUpJobs === [] && $this->idleWorkersForkedAt !== $this->heldFacts();
     }
 
     /**
@@ -167,11 +181,18 @@ final class FactStore implements BackgroundWork
     {
         if ($this->pool->needsWorkers()) {
             $this->pool->addOne();
+            $this->idleWorkersForkedAt = $this->heldFacts();
 
             return;
         }
         if ($this->saveDue()) {
             $this->save();
+
+            return;
+        }
+        if ($this->idleWorkersBehind()) {
+            $this->pool->renewIdle();
+            $this->idleWorkersForkedAt = $this->heldFacts();
 
             return;
         }
