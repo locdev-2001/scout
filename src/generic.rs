@@ -181,20 +181,56 @@ impl GenericIndex {
     }
 }
 
-/// The function a line is in, read from the text around it: the nearest `function`/`def`/`fn`/`func`/`sub` above
-/// it, named after the nearest `class` above that one (`Orders_model::get`). A guess, said as one.
+/// Words a declaration may start with before its keyword (`export default function`, `public static function`).
+const MODIFIERS: [&str; 22] = [
+    "export", "default", "async", "public", "private", "protected", "internal", "static", "final", "abstract", "readonly", "override", "virtual", "sealed", "open",
+    "data", "inline", "pub", "unsafe", "extern", "const", "suspend",
+];
+
+/// The name a line declares with one of `keywords`: the keyword comes first, after modifiers only, so neither a
+/// comment (`// the class of`), nor a variable (`$class`), nor a call (`$this->function(`) counts. A Go method's
+/// receiver (`func (r *Cart) Add`) is skipped.
+fn declared(line: &str, keywords: &[&str]) -> Option<String> {
+    let mut rest = line.trim_start();
+    if ["//", "#", "*", "/*", "--", ";"].iter().any(|comment| rest.starts_with(comment)) {
+        return None;
+    }
+    loop {
+        let word: String = rest.chars().take_while(|character| character.is_alphanumeric() || *character == '_').collect();
+        if word.is_empty() {
+            return None;
+        }
+        rest = rest[word.len()..].trim_start();
+        if keywords.contains(&word.as_str()) {
+            break;
+        }
+        if !MODIFIERS.contains(&word.as_str()) {
+            return None;
+        }
+        // `pub(crate)`.
+        if rest.starts_with('(') {
+            rest = rest.split_once(')').map_or("", |(_, after)| after).trim_start();
+        }
+    }
+    if rest.starts_with('(') {
+        rest = rest.split_once(')').map_or("", |(_, after)| after).trim_start();
+    }
+    let name: String = rest.chars().take_while(|character| character.is_alphanumeric() || *character == '_').collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The function a line is in, read from the text around it: the nearest `function`/`def`/`fn`/`func`/`sub`
+/// declared above it, named after the nearest `class` declared above that one and indented less
+/// (`Orders_model::get`). A guess, said as one.
 fn locate(repo_root: &Path, file: &str, line: usize) -> Value {
     let Ok(text) = fs::read_to_string(repo_root.join(file)) else { return Value::Null };
     let lines: Vec<&str> = text.lines().collect();
-    let defined = |text: &str, keywords: &[&str]| {
-        let words: Vec<&str> = text.split(|character: char| !(character.is_alphanumeric() || character == '_')).filter(|word| !word.is_empty()).collect();
-        words.windows(2).find(|pair| keywords.contains(&pair[0])).map(|pair| pair[1].to_owned())
-    };
+    let indent = |text: &str| text.len() - text.trim_start().len();
     let top = line.min(lines.len());
-    let Some((at, function)) = (0..top).rev().find_map(|index| defined(lines[index], &["function", "def", "fn", "func", "sub"]).map(|name| (index, name))) else {
+    let Some((at, function)) = (0..top).rev().find_map(|index| declared(lines[index], &["function", "def", "fn", "func", "sub"]).map(|name| (index, name))) else {
         return json!({ "symbol": format!("{file}#(file)"), "file": file, "line": 1, "kind": "file" });
     };
-    let owner = (0..at).rev().find_map(|index| defined(lines[index], &["class", "trait", "interface", "struct", "impl"]));
+    let owner = (0..at).rev().filter(|index| indent(lines[*index]) < indent(lines[at])).find_map(|index| declared(lines[index], &["class", "trait", "interface", "struct", "impl"]));
     let symbol = owner.map_or(function.clone(), |owner| format!("{owner}::{function}"));
     json!({ "symbol": symbol, "file": file, "line": at + 1, "kind": "text" })
 }
