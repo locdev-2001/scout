@@ -128,7 +128,10 @@ function sharedCheckoutRoot(string $repoRoot): ?string
     return $roots[$repoRoot];
 }
 
-/** A path into the shared checkout's own code (not its packages) as the same path in this repository. */
+/**
+ * A path into the shared checkout's own code (not its packages) as the same path in this repository; a path already
+ * in this repository is kept (a worktree may sit inside the checkout it shares, as `.claude/worktrees/x` does).
+ */
 function checkoutPath(string $path, string $sharedRoot, string $repoRoot): string
 {
     $parts = [];
@@ -141,5 +144,7 @@ function checkoutPath(string $path, string $sharedRoot, string $repoRoot): strin
     }
     $normalized = implode('/', $parts);
 
-    return str_starts_with($normalized, $sharedRoot.'/') && ! str_starts_with($normalized, $sharedRoot.'/vendor/') ? $repoRoot.substr($normalized, strlen($sharedRoot)) : $path;
+    $shared = str_starts_with($normalized, $sharedRoot.'/') && ! str_starts_with($normalized, $sharedRoot.'/vendor/') && ! str_starts_with($normalized, $repoRoot.'/');
+
+    return $shared ? $repoRoot.substr($normalized, strlen($sharedRoot)) : $path;
 }
