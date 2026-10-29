@@ -19,7 +19,7 @@ $tasks = function (string $kind, array $items) use ($repoRoot): mixed {
 
     return match ($kind) {
         'files' => array_combine(array_column($items, 0), array_map(fn (array $item) => $extraction->fileFacts(...$item), $items)),
-        'classes' => array_map([$extraction, 'classFacts'], $items),
+        'classes' => array_map(fn (array $item) => $extraction->classFacts(...$item), $items),
         'answers' => $extraction->answers($items),
         'refresh' => array_combine(array_column($items, 0), array_map(fn (array $job) => $extraction->refreshSites($job[0], $job[1]), $items)),
         'function' => $extraction->functionFacts($items[0]),

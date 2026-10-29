@@ -105,6 +105,9 @@ final class FactStore implements BackgroundWork
     /** @var array<string, array> lowercase class => class facts */
     private array $classFacts = [];
 
+    /** @var array<string, string> lowercase declared class => the file declaring it */
+    private array $declaringFile = [];
+
     /** @var array<string, true> lowercase names that did not resolve to a class; any PHP change may create them */
     private array $missingClasses = [];
 
@@ -623,7 +626,7 @@ final class FactStore implements BackgroundWork
         }
         $this->indexConstructions($path, $facts['byName']['__construct'] ?? [], false);
         foreach (array_keys($facts['classes']) as $class) {
-            unset($this->declaredClasses[$class]);
+            unset($this->declaredClasses[$class], $this->declaringFile[$class]);
             $this->descendants = null;
         }
         unset($this->fileFacts[$path]);
@@ -719,6 +722,7 @@ final class FactStore implements BackgroundWork
         }
         $this->indexConstructions($path, $byName['__construct'] ?? [], true);
         $this->declaredClasses = $fileFacts['classes'] + $this->declaredClasses;
+        $this->declaringFile = array_fill_keys(array_keys($fileFacts['classes']), $path) + $this->declaringFile;
         if ($fileFacts['classes'] !== []) {
             $this->descendants = null;
         }
@@ -770,8 +774,9 @@ final class FactStore implements BackgroundWork
         $started = microtime(true);
         // A class no child survived describing is unknown, like one that does not exist.
         $lost = [];
-        $chunks = $this->mapSurviving('classes', array_values($missing), (int) ceil(count($missing) / $this->parallelism), function (string $class) use (&$lost) {
-            $lost[strtolower($class)] = true;
+        $items = array_map(fn (string $class) => [$class, $this->declaredAlongside($class)], array_values($missing));
+        $chunks = $this->mapSurviving('classes', $items, (int) ceil(count($missing) / $this->parallelism), function (array $item) use (&$lost) {
+            $lost[strtolower($item[0])] = true;
         });
         profilePhase('classes: fetched', $started, ['count' => count($missing)]);
         $requested = array_keys(array_diff_key($missing, $lost));
@@ -781,6 +786,20 @@ final class FactStore implements BackgroundWork
         foreach (array_keys($lost) as $class) {
             $this->storeClass($class, null);
         }
+    }
+
+    /**
+     * The other classes declared in the file declaring $class: loading one makes $class known when Composer cannot
+     * find it by its name (a stub class written in a test file), whichever classes a child happened to load before.
+     *
+     * @return list<string>
+     */
+    private function declaredAlongside(string $class): array
+    {
+        $path = $this->declaringFile[strtolower(ltrim($class, '\\'))] ?? null;
+        $declared = $path === null ? [] : array_column($this->fileFacts[$path]['classes'] ?? [], 0);
+
+        return array_values(array_filter($declared, fn (string $name) => strcasecmp($name, ltrim($class, '\\')) !== 0));
     }
 
     private function storeClass(string $requested, ?array $facts): void
@@ -1153,11 +1172,12 @@ final class FactStore implements BackgroundWork
         $root = $this->files->repoRoot;
         while (count($this->warmUpJobs) < self::WARM_UP_WORKERS && $this->classWarmUpQueue !== []) {
             $chunk = array_splice($this->classWarmUpQueue, 0, self::WARM_UP_CLASSES_PER_JOB);
-            $job = ForkedWorker::startBackground(function () use ($root, $chunk) {
+            $items = array_map(fn (string $class) => [$class, $this->declaredAlongside($class)], $chunk);
+            $job = ForkedWorker::startBackground(function () use ($root, $items) {
                 ini_set('opcache.enable', '0');
                 $extraction = new FactExtraction(new PhpFileCache($root));
 
-                return array_map(fn (string $class) => $extraction->classFacts($class), $chunk);
+                return array_map(fn (array $item) => $extraction->classFacts(...$item), $items);
             }, 'warm-up classes', takesSlot: true);
             $this->warmUpJobs[(int) $job[1]] = $job;
             $this->warmUpChunks[(int) $job[1]] = ['classes', $chunk, $this->changeSerial];

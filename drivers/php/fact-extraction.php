@@ -480,8 +480,16 @@ final class FactExtraction
      *
      * @return array{name: string, file: ?string, line: int, ancestors: list<string>, methods: array<string, array>, magic: bool, deps: list<string>}|null
      */
-    public function classFacts(string $class): ?array
+    public function classFacts(string $class, array $declaredAlongside = []): ?array
     {
+        $known = fn (string $name) => rescueReflection(fn () => class_exists($name) || interface_exists($name) || trait_exists($name)) === true;
+        if (! $known($class)) {
+            foreach ($declaredAlongside as $sibling) {
+                if ($known($sibling) && $known($class)) {
+                    break;
+                }
+            }
+        }
         $reflection = rescueReflection(fn () => new ReflectionClass($class));
         if (! $reflection instanceof ReflectionClass) {
             return null;
