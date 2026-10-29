@@ -296,9 +296,10 @@ fn answer(stream: &Stream, pool: &mut DriverPool, freshness: &mut Freshness, rep
     let _ = File::create(&busy);
     answer_question(stream, pool, freshness, repo_root);
     let _ = fs::remove_file(&busy);
-    // Its modification time tells other servers when this one was last asked (see `enforce_budget`).
-    if let Ok(info) = fs::read_to_string(socket.with_extension("info")) {
-        let _ = fs::write(socket.with_extension("info"), info);
+    // Its modification time tells other servers when this one was last asked (see `enforce_budget`). Touched, not
+    // written again: a rewrite is an empty file for a moment, and a reader then misses this server.
+    if let Ok(info) = File::options().write(true).open(socket.with_extension("info")) {
+        let _ = info.set_modified(SystemTime::now());
     }
     last_activity.store(now_seconds(), Ordering::Relaxed);
 }
