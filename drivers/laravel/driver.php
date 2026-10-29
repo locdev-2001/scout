@@ -577,6 +577,7 @@ final class LaravelWiring implements BackgroundWork
 
         return [
             'exists' => $exists,
+            'trait' => (bool) rescueReflection(fn () => trait_exists($class)),
             'traits' => $exists ? array_values(class_uses_recursive($class)) : [],
             'parents' => $exists ? array_values(class_parents($class)) : [],
             'dispatchMethods' => $exists ? array_values(array_filter(self::DISPATCH_METHODS, fn (string $name) => method_exists($class, $name))) : [],
@@ -660,10 +661,14 @@ final class LaravelWiring implements BackgroundWork
 
         // Eloquent reaches some methods by a name derived from theirs: `scopeActive` as `->active()`,
         // `getFullNameAttribute` as `->full_name`.
-        if (preg_match('/^scope(\w+)$/', $method, $match)) {
-            array_push($edges, ...$this->conventionUses($class, lcfirst($match[1]), true));
-        } elseif (preg_match('/^get(\w+)Attribute$/', $method, $match)) {
-            array_push($edges, ...$this->conventionUses($class, \Illuminate\Support\Str::snake($match[1]), false));
+        // One a trait declares is reached through each class using it (`Combo::query()->workspaceLevel()`).
+        $owners = ($this->traitsOf($class)['trait'] ?? false) ? $this->classesUsing($class) : [$class];
+        foreach ($owners as $owner) {
+            if (preg_match('/^scope(\w+)$/', $method, $match)) {
+                array_push($edges, ...$this->conventionUses($owner, lcfirst($match[1]), true));
+            } elseif (preg_match('/^get(\w+)Attribute$/', $method, $match)) {
+                array_push($edges, ...$this->conventionUses($owner, \Illuminate\Support\Str::snake($match[1]), false));
+            }
         }
 
         // Methods the framework itself calls on classes of a kind: the entry point is the framework's step.
@@ -707,6 +712,32 @@ final class LaravelWiring implements BackgroundWork
 
             return $written === $command || str_starts_with($written, "{$command} ") ? [self::COMMAND_RUNNERS[$callee], 'exact'] : null;
         });
+    }
+
+    /**
+     * The classes whose body has `use Trait;`, read from the files that name the trait.
+     *
+     * @return list<string>
+     */
+    private function classesUsing(string $trait): array
+    {
+        $short = strtolower(substr(strrchr('\\'.$trait, '\\'), 1));
+        $uses = $this->scanTokens("uses|{$trait}", [$short], ['--word-regexp', '--fixed-strings', '--ignore-case', '-e', $short], function ($file, int $index) use ($short) {
+            $tokens = $file->tokens;
+            $name = strtolower(ltrim($tokens[$index]->text, '\\'));
+            if ($name !== $short && ! str_ends_with($name, '\\'.$short)) {
+                return null;
+            }
+            // `use A, Trait;` in a class body: names and commas back to `use` (a closure's `use (` has a parenthesis).
+            $back = $index - 1;
+            while ($back > 0 && ($tokens[$back]->text === ',' || in_array($tokens[$back]->id, [T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED], true))) {
+                $back--;
+            }
+
+            return $tokens[$back]->id === T_USE && $file->innermostScopeAtToken($index)?->kind === 'class' ? ['uses', 'exact'] : null;
+        });
+
+        return array_values(array_unique(array_map(fn (array $edge) => $edge['from']['symbol'], $uses)));
     }
 
     /**
