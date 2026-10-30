@@ -793,6 +793,10 @@ impl LspDriver {
         }
     }
 
+    fn failure_warning(&self) -> Option<String> {
+        self.failure.as_ref().map(|failure| format!("{} could not start ({failure}); callers in its files are unknown", self.config.language_id))
+    }
+
     fn server(&mut self) -> Result<&mut Server, String> {
         if self.server.is_none() && self.failure.is_none() {
             match Server::start(&self.config, &self.repo_root) {
@@ -1545,6 +1549,7 @@ pub fn serve(repo_root: &Path) {
     });
     let mut stdout = std::io::stdout();
     let mut waiting: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
+    let mut sync_told_failure = false;
     loop {
         if waiting.is_empty() {
             // Idle: answer ahead for the next symbols of the warm-up, a few at a time, so a question that arrives
@@ -1590,14 +1595,27 @@ pub fn serve(repo_root: &Path) {
             "sync" => {
                 let changed = request.get("changed").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
                 let mut answer = driver.sync(changed);
-                if let Some(failure) = &driver.failure {
-                    answer["warnings"] = json!([format!("{} could not start ({failure}); callers in its files are unknown", driver.config.language_id)]);
+                sync_told_failure = driver.failure.is_some();
+                if let Some(warning) = driver.failure_warning() {
+                    answer["warnings"] = json!([warning]);
                 } else if let Some(trouble) = driver.server.as_ref().and_then(|server| server.trouble.as_ref()) {
                     answer["warnings"] = json!([format!("{} could not load the project as configured ({trouble}); callers found by name may be marked unresolved", driver.config.command.first().cloned().unwrap_or_default())]);
                 }
                 answer
             }
-            "resolve" => driver.resolve(&text("query")),
+            "resolve" => {
+                let found = driver.resolve(&text("query"));
+                // The server starts with the first question about its language, after that question's `sync`
+                // was answered: a server that cannot start is told here, or the name just looks missing.
+                match driver.failure_warning() {
+                    Some(warning) if !sync_told_failure && found.as_array().is_none_or(Vec::is_empty) => {
+                        let _ = writeln!(stdout, "{}", json!({ "id": request.get("id"), "error": warning }));
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    _ => found,
+                }
+            }
             "locate" => driver.locate(&text("file"), request.get("line").and_then(Value::as_u64).unwrap_or(1) as u32),
             _ => Value::Null,
         };

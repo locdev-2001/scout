@@ -89,13 +89,15 @@ pub fn execute(pool: &mut DriverPool, freshness: &mut Freshness, repo_root: &Pat
     let mut source = SourceLines::new(repo_root.to_path_buf());
     let position = parse_position(&request.query, repo_root, &request.cwd);
     let locates_lines = request.command == "locate" && position.is_some();
+    let asked_file = position.as_ref().map(|(file, _)| file.as_str()).or_else(|| request.query.split_once('#').map(|(file, _)| file));
+    let asked_extension = asked_file.and_then(|file| Path::new(file).extension()).map(|extension| extension.to_string_lossy().to_lowercase());
     let started = Instant::now();
     let targets = resolve_target(pool, &request.query, position);
     profile_phase("resolve", started);
 
     let out = &mut response.stdout;
     let mut not_found = false;
-    let mut answered_extensions = std::collections::BTreeSet::new();
+    let mut answered_extensions: std::collections::BTreeSet<String> = asked_extension.iter().cloned().collect();
     match targets.as_slice() {
         [] => {
             let _ = writeln!(response.stderr, "Not found: \"{}\".", request.query);
@@ -149,10 +151,13 @@ pub fn execute(pool: &mut DriverPool, freshness: &mut Freshness, repo_root: &Pat
     }
     finish_synchronize(pool, freshness, synchronizing);
     // Warnings say where callers may be unknown: that matters to a `callers` answer, not to `locate`.
+    // A driver that could not read its files makes a symbol in them look missing: its warning goes with an answer
+    // naming those files or asked about one, and with a bare name found nowhere, which any language could hold.
     let mut warnings = std::mem::take(&mut pool.warnings);
     warnings.extend(pool.unavailable.iter().cloned());
+    let bare_name_missing = asked_extension.is_none() && (targets.is_empty() || not_found);
     for (warning, extensions) in std::mem::take(&mut pool.language_warnings) {
-        if extensions.iter().any(|extension| answered_extensions.contains(&extension.to_lowercase())) {
+        if bare_name_missing || extensions.iter().any(|extension| answered_extensions.contains(&extension.to_lowercase())) {
             warnings.insert(warning);
         }
     }
