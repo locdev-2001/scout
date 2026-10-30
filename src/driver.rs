@@ -80,8 +80,9 @@ struct Driver {
     parked: HashMap<u64, Result<Value, String>>,
     /// Bumped on every restart, so answers owed by a process that died are not waited for.
     generation: u64,
-    /// Kept answers of `manifest.cache` operations, by request; a restarted process starts without any.
-    answers: HashMap<String, (Option<String>, Arc<Value>)>,
+    /// Kept answers of `manifest.cache` operations, by request, as the symbol asked about and the answer's JSON
+    /// text: a parsed answer takes about ten times the memory of its text. A restarted process starts without any.
+    answers: HashMap<String, (Option<String>, Box<str>)>,
     /// A `sync` whose invalidations must be applied before a kept answer is used again.
     pending_sync: Option<u64>,
     /// Requests not answered yet, as sent: named in the log when the driver hangs on one.
@@ -476,7 +477,7 @@ impl DriverPool {
 
     /// Sends every request to every driver that answers `op` before reading any answer, so drivers work in
     /// parallel; returns per request the non-null answers.
-    /// Answers are shared, not copied: a kept answer can hold thousands of edges.
+    /// A fresh answer is shared, not copied (it can hold thousands of edges); a kept one is read from its text.
     pub fn ask_many(&mut self, op: &str, requests: &[Value]) -> Vec<Vec<Arc<Value>>> {
         let keys: Vec<String> = requests.iter().map(|request| format!("{op} {request}")).collect();
         let mut answers: Vec<Vec<Arc<Value>>> = vec![Vec::new(); requests.len()];
@@ -519,12 +520,12 @@ impl DriverPool {
                         let answer = answer.map(Arc::new);
                         if let (true, Ok(value)) = (keeps, &answer) {
                             let symbol = requests[index].get("symbol").and_then(Value::as_str).map(str::to_owned);
-                            driver.answers.insert(keys[index].clone(), (symbol, Arc::clone(value)));
+                            driver.answers.insert(keys[index].clone(), (symbol, value.to_string().into_boxed_str()));
                         }
                         answer
                     }
                     None => match driver.answers.get(&keys[index]) {
-                        Some((_, value)) => Ok(Arc::clone(value)),
+                        Some((_, text)) => serde_json::from_str(text).map(Arc::new).map_err(|error| format!("{}: kept answer unreadable: {error}", driver.name)),
                         None => continue,
                     },
                 };
