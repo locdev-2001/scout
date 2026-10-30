@@ -136,6 +136,16 @@ def declared_package_dirs(folders):
     return sorted(found, key=lambda pair: len(pair[0]), reverse=True)
 
 
+# A reference is a tuple of these fields, None where one does not apply: a quarter smaller than a dict, quicker to read
+# and to pickle (769,000 of them in an 8,400-file project).
+REFERENCE_FIELDS = ("to", "name", "line", "kind", "from", "key", "owner", "member", "module", "modules", "likely", "implicit")
+TO, NAME, LINE, KIND, FROM, KEY, OWNER, MEMBER, MODULE, MODULES, LIKELY, IMPLICIT = range(len(REFERENCE_FIELDS))
+
+
+def with_kind(reference, kind):
+    return (*reference[:KIND], kind, *reference[KIND + 1 :])
+
+
 class FileFacts:
     def __init__(self, path):
         self.path = path
@@ -147,7 +157,7 @@ class FileFacts:
         self.bases = {}  # class key -> [binding]
         self.exports = {}  # name -> key (module-level definitions)
         self.reexports = {}  # name -> (module, name) imported names, visible as attributes of this module
-        self.references = []  # dicts
+        self.references = []  # tuples of REFERENCE_FIELDS
         self.entries = {}  # key -> [(line, decorator text)]
         self.star_modules = []  # modules `from x import *` brings names from
         self.instances = {}  # module-level name -> class name it was made with (`registry = ToolRegistry()`)
@@ -468,7 +478,7 @@ class Reader(ast.NodeVisitor):
 
     def add(self, **reference):
         reference.setdefault("from", self.current_key())
-        self.facts.references.append(reference)
+        self.facts.references.append(tuple(reference.get(field) for field in REFERENCE_FIELDS))
 
     def visit_Name(self, node):
         if not isinstance(node.ctx, ast.Load):
@@ -691,12 +701,12 @@ class Store:
     def install(self, path, facts):
         self.facts[path] = facts
         for reference in facts.references:
-            if reference["to"] in ("global", "member", "self", "star", "super"):
-                self.by_name.setdefault(reference["name"], set()).add(path)
-            elif reference["to"] == "import":
-                self.by_module.setdefault(reference["module"], set()).add(path)
-                if reference.get("member"):
-                    self.by_name.setdefault(reference["member"], set()).add(path)
+            if reference[TO] in ("global", "member", "self", "star", "super"):
+                self.by_name.setdefault(reference[NAME], set()).add(path)
+            elif reference[TO] == "import":
+                self.by_module.setdefault(reference[MODULE], set()).add(path)
+                if reference[MEMBER]:
+                    self.by_name.setdefault(reference[MEMBER], set()).add(path)
         for module, _ in facts.reexports.values():
             self.by_module.setdefault(module, set()).add(path)
         for key, bases in facts.bases.items():
@@ -990,13 +1000,13 @@ class Store:
         edges = []
 
         def edge(file, reference, confidence):
-            edges.append({"from": self.ref(file, reference["from"]), "at": {"file": file, "line": reference["line"]}, "kind": reference["kind"], "confidence": confidence})
+            edges.append({"from": self.ref(file, reference[FROM]), "at": {"file": file, "line": reference[LINE]}, "kind": reference[KIND], "confidence": confidence})
 
         for line, decorator in facts.entries.get(key, []):
             edges.append({"from": {"symbol": f"@{decorator} ({path}:{line})", "kind": "entry"}, "at": {"file": path, "line": line}, "kind": "decorator", "confidence": "exact"})
         for reference in facts.references:
-            if reference["to"] == "own" and reference["key"] == key:
-                edge(path, reference, "likely" if reference.get("likely") else "exact")
+            if reference[TO] == "own" and reference[KEY] == key:
+                edge(path, reference, "likely" if reference[LIKELY] else "exact")
         owner, _, member = key.rpartition(".")
         if owner in facts.methods:
             # `self.area()` in a subclass runs this method when no class between them defines its own.
@@ -1004,20 +1014,20 @@ class Store:
                 if self.first_definer(sub_path, sub_key, member) != (path, owner):
                     continue
                 for reference in self.get(sub_path).references:
-                    if reference["to"] == "self" and reference["owner"] == sub_key and reference["name"] == member:
+                    if reference[TO] == "self" and reference[OWNER] == sub_key and reference[NAME] == member:
                         edge(sub_path, reference, "exact")
             # Written in a base class, `self.area()` runs this override when the object is of this class.
             for base_path, base_key in self.ancestors_of(path, owner):
                 for reference in self.get(base_path).references:
-                    own = reference["to"] == "own" and reference["key"] == f"{base_key}.{member}"
-                    hook = reference["to"] == "self" and reference["owner"] == base_key and reference["name"] == member
+                    own = reference[TO] == "own" and reference[KEY] == f"{base_key}.{member}"
+                    hook = reference[TO] == "self" and reference[OWNER] == base_key and reference[NAME] == member
                     if own or hook:
                         edge(base_path, reference, "likely")
             # `super().area()` in a subclass runs the nearest base class's own definition.
             for file in self.by_name.get(member, ()):
                 for reference in self.get(file).references:
-                    if reference["to"] == "super" and reference["name"] == member and reference["owner"]:
-                        caller = (file, reference["owner"])
+                    if reference[TO] == "super" and reference[NAME] == member and reference[OWNER]:
+                        caller = (file, reference[OWNER])
                         if self.next_definer(caller, caller, member) == (path, owner):
                             edge(file, reference, "exact")
                         # Cooperative inheritance: in an object of a subclass with several bases, the method after
@@ -1039,31 +1049,31 @@ class Store:
             family = {(path, owner), *self.subclasses_of(path, owner)}
             for file in list(self.facts):
                 for reference in self.get(file).references:
-                    if reference["to"] == "self" and reference["owner"] and (file, reference["owner"]) in family and not self.holds(file, reference["owner"], reference["name"]):
+                    if reference[TO] == "self" and reference[OWNER] and (file, reference[OWNER]) in family and not self.holds(file, reference[OWNER], reference[NAME]):
                         edge(file, reference, "likely")
             # Through the class imported elsewhere: `cart = Cart(); cart.item_0`.
             for class_path, class_key in family:
                 for module, name, item in self.aliases(class_path, class_key):
                     for importer in self.by_module.get(module, ()) if item is None else ():
                         for reference in self.get(importer).references:
-                            member_read = reference["to"] == "import" and reference["module"] == module and reference["name"] == name and reference.get("member")
-                            if member_read and not self.holds(class_path, class_key, reference["member"]):
+                            member_read = reference[TO] == "import" and reference[MODULE] == module and reference[NAME] == name and reference[MEMBER]
+                            if member_read and not self.holds(class_path, class_key, reference[MEMBER]):
                                 edge(importer, reference, "likely")
         # Reached by the name of a subclass that inherits it unchanged too: `Cart().add()` runs `Base.add`.
         inheriting = [(sub_path, f"{sub_key}.{member}") for sub_path, sub_key in self.subclasses_of(path, owner) if self.first_definer(sub_path, sub_key, member) == (path, owner)] if owner in facts.methods else []
         for module, name, item in [alias for named in [(path, key), *inheriting] for alias in self.aliases(*named)]:
             for importer in self.by_module.get(module, ()):
                 for reference in self.get(importer).references:
-                    if reference["to"] != "import" or reference["module"] != module:
+                    if reference[TO] != "import" or reference[MODULE] != module:
                         continue
                     if name == "*":
-                        matches = reference["name"] == "*" and reference["member"] == (item.split(".")[0] if item else None)
+                        matches = reference[NAME] == "*" and reference[MEMBER] == (item.split(".")[0] if item else None)
                     else:
-                        matches = reference["name"] == name and (item is None or reference["member"] == item)
-                    if matches and item is None and reference.get("member"):
+                        matches = reference[NAME] == name and (item is None or reference[MEMBER] == item)
+                    if matches and item is None and reference[MEMBER]:
                         # `for x in make():` also runs `__iter__` of the result; the call itself is listed already.
-                        if not reference.get("implicit"):
-                            edge(importer, {**reference, "kind": "reference"}, "exact")
+                        if not reference[IMPLICIT]:
+                            edge(importer, with_kind(reference, "reference"), "exact")
                     elif matches:
                         edge(importer, reference, "exact")
         # Names an untyped object or an unbound name could mean this symbol by.
@@ -1076,12 +1086,12 @@ class Store:
             for module, alias, item in (self.aliases(path, owner) if is_method else [])
             if item is None
             for importer in self.by_module.get(module, ())
-            if any(reference["to"] == "import" and reference["module"] == module and reference["name"] == alias for reference in self.get(importer).references)
+            if any(reference[TO] == "import" and reference[MODULE] == module and reference[NAME] == alias for reference in self.get(importer).references)
         }
         for file in self.by_name.get(name, ()):
             for reference in self.get(file).references:
-                if is_method and reference["to"] == "import" and reference.get("member") == name and reference["name"] != "*":
-                    confidence = self.member_of_import(reference["module"], reference["name"], family)
+                if is_method and reference[TO] == "import" and reference[MEMBER] == name and reference[NAME] != "*":
+                    confidence = self.member_of_import(reference[MODULE], reference[NAME], family)
                     # `with make_scope():` runs `__enter__` of whatever the function returns: as for any object of
                     # unknown class, only where the class is imported.
                     if confidence == "unresolved" and name.startswith("__") and file not in naming_class:
@@ -1089,22 +1099,22 @@ class Store:
                     if confidence:
                         edge(file, reference, confidence)
                     continue
-                if reference.get("name") != name:
+                if reference[NAME] != name:
                     continue
-                if reference["to"] == "member" and is_method:
+                if reference[TO] == "member" and is_method:
                     # `with lock:` or `handler()` on an object of unknown class: thousands of them in a large
                     # project, so only where the class is imported (or in its own file).
-                    if not reference.get("implicit") or file in naming_class:
+                    if not reference[IMPLICIT] or file in naming_class:
                         edge(file, reference, "unresolved")
-                elif reference["to"] == "self" and "." in key and reference["owner"] != owner and not self.related(file, reference["owner"], path, owner):
+                elif reference[TO] == "self" and "." in key and reference[OWNER] != owner and not self.related(file, reference[OWNER], path, owner):
                     # The calling class's own hierarchy defines it elsewhere: not this method.
-                    if not (reference["owner"] and self.first_definer(file, reference["owner"], name)):
+                    if not (reference[OWNER] and self.first_definer(file, reference[OWNER], name)):
                         edge(file, reference, "unresolved")
-                elif reference["to"] == "global" and "." not in key:
+                elif reference[TO] == "global" and "." not in key:
                     edge(file, reference, "unresolved")
-                elif reference["to"] == "star" and "." not in key:
+                elif reference[TO] == "star" and "." not in key:
                     # `from lib import *`: exact when the starred module defines (or re-exports) this very name.
-                    defined = [self.resolve_export(module, name) for module in reference["modules"]]
+                    defined = [self.resolve_export(module, name) for module in reference[MODULES]]
                     if (path, key) in defined:
                         edge(file, reference, "exact")
                     elif not any(defined):
