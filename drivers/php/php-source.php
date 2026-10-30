@@ -472,7 +472,7 @@ function rescueReflection(callable $probe): mixed
 
 final class PhpFileCache
 {
-    /** @var array<string, PhpFileModel> */
+    /** @var array<string, PhpFileModel|null> read files, the most recently asked for last */
     private array $models = [];
 
     /** @var list<string>|null paths Composer autoloads only for development: tests and their helpers */
@@ -487,7 +487,11 @@ final class PhpFileCache
     /** @var array<string, true> files changed since the word index was built: always searched by reading them */
     private array $changedSinceIndex = [];
 
-    public function __construct(public readonly string $repoRoot) {}
+    /**
+     * @param  int|null  $modelsKept  read files kept for later questions, the least recently asked for dropped first;
+     *                                null keeps every one (a model holds about 24 times its file's size)
+     */
+    public function __construct(public readonly string $repoRoot, private readonly ?int $modelsKept = null) {}
 
     /**
      * Files the core reported changed (added, removed or edited), so the word index never answers from old text.
@@ -544,12 +548,21 @@ final class PhpFileCache
 
     public function get(string $relativePath): ?PhpFileModel
     {
-        if (! array_key_exists($relativePath, $this->models)) {
-            $source = @file_get_contents($this->repoRoot.'/'.$relativePath);
-            $this->models[$relativePath] = $source === false ? null : new PhpFileModel($relativePath, $source);
-        }
+        if (array_key_exists($relativePath, $this->models)) {
+            $model = $this->models[$relativePath];
+            if ($this->modelsKept !== null) {
+                unset($this->models[$relativePath]);
+                $this->models[$relativePath] = $model;
+            }
 
-        return $this->models[$relativePath];
+            return $model;
+        }
+        if ($this->modelsKept !== null && count($this->models) >= $this->modelsKept) {
+            unset($this->models[array_key_first($this->models)]);
+        }
+        $source = @file_get_contents($this->repoRoot.'/'.$relativePath);
+
+        return $this->models[$relativePath] = $source === false ? null : new PhpFileModel($relativePath, $source);
     }
 
     /** Drops what was read of a file that changed. */

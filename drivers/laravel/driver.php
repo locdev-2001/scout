@@ -970,7 +970,8 @@ final class LaravelWiring implements BackgroundWork
 $repoRoot = rtrim(realpath($argv[1] ?? '') ?: '', '/');
 limitCompiledCode();
 loadComposerAutoload($repoRoot);
-$wiring = new LaravelWiring(new PhpFileCache($repoRoot), new EngineGuard($repoRoot));
+// A scan reads each file once and keeps its edges, so files are read again only by another scan: a few are enough.
+$wiring = new LaravelWiring(new PhpFileCache($repoRoot, modelsKept: 32), new EngineGuard($repoRoot));
 $wiring->startTraitWarmUp();
 
 serveDriver([
