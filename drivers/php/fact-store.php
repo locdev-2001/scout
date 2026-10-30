@@ -90,11 +90,37 @@ final class FactStore implements BackgroundWork
     /** True once every PHP file of the repo has facts; a name then needs no search to be complete. */
     private bool $allExtracted = false;
 
-    /** @var array<string, array> repo-relative path => file facts */
+    /**
+     * Repo-relative path => what is read of every file a question walks (`hash`, `answerHash`, `deps`, `classes`,
+     * `mentions`, `carried`), and the rest packed in Payload strings, a third of the memory of the arrays they hold:
+     * `packedSites` (called name => its call sites), `packedScopes`, and `packedRest` (`questions`, `units`, read
+     * only when files change). Read through facts(), sitesCalled(), allSites(), scopes() and questions(); written
+     * through keep().
+     *
+     * @var array<string, array>
+     */
     private array $fileFacts = [];
+
+    /** The parts of a file's facts kept packed, as facts() returns them. */
+    private const PACKED_PARTS = ['byName' => true, 'questions' => true, 'scopes' => true, 'units' => true];
+
+    /** Scopes of the files read last: every caller found in a file names the scope it is in. */
+    private const SCOPES_KEPT = 64;
+
+    /** @var array<string, list<array>> path => unpacked scopes, most recently read last */
+    private array $unpackedScopes = [];
 
     /** @var array<string, array<string, true>> lowercase call name => paths having such call sites */
     private array $pathsByName = [];
+
+    /** @var array<string, array<string, true>> lowercase method name => paths declaring a method of that name */
+    private array $pathsByMethodName = [];
+
+    /** @var array<string, array<string, true>> lowercase class a call's receiver can be => paths having such calls */
+    private array $pathsByReceiverType = [];
+
+    /** @var array<string, string> lowercase receiver class => its name as first written at a call */
+    private array $receiverTypeNames = [];
 
     /** @var array<string, array<string, true>> lowercase class => paths constructing it (`new`, `parent::__construct`) */
     private array $constructions = [];
@@ -105,8 +131,11 @@ final class FactStore implements BackgroundWork
     /** @var array<string, array> lowercase class => class facts */
     private array $classFacts = [];
 
-    /** @var array<string, list<mixed>> one copy of each list of receiver types or question positions sites hold */
-    private array $sharedLists = [];
+    /** @var array<string, int> each list of receiver types or question positions sites hold => its index in $lists */
+    private array $listIndex = [];
+
+    /** @var list<list<mixed>> one copy of each such list; packed sites hold its index */
+    private array $lists = [];
 
     /** @var array<string, string> lowercase declared class => the file declaring it */
     private array $declaringFile = [];
@@ -331,14 +360,14 @@ final class FactStore implements BackgroundWork
     {
         $previous = [];
         foreach ($paths as $path) {
-            $previous[$path] = $this->fileFacts[$path] ?? null;
+            $previous[$path] = $this->facts($path);
             $this->forgetFile($path);
         }
         $root = $this->files->repoRoot;
         $this->extractFiles(array_values(array_filter($paths, fn (string $path) => is_file("{$root}/{$path}"))), array_filter($previous), $this->changedNow);
 
         foreach ($previous as $path => $old) {
-            $new = $this->fileFacts[$path] ?? null;
+            $new = $this->facts($path);
             if ($old === null) {
                 $wholeFiles[$path] = true;
             } else {
@@ -474,7 +503,7 @@ final class FactStore implements BackgroundWork
     {
         $toAsk = [];
         foreach ($paths as $path) {
-            foreach ($this->fileFacts[$path]['questions'] ?? [] as [$question, , $units]) {
+            foreach ($this->questions($path) as [$question, , $units]) {
                 foreach (array_keys($units) as $unit) {
                     if ($unitChanged($unit)) {
                         $toAsk[$question] = true;
@@ -495,7 +524,7 @@ final class FactStore implements BackgroundWork
 
         $stale = [];
         foreach ($paths as $path) {
-            $questions = $this->fileFacts[$path]['questions'] ?? [];
+            $questions = $this->questions($path);
             $changed = [];
             foreach ($questions as $position => [$question, $hash]) {
                 if (isset($unanswered[$question])) {
@@ -521,12 +550,13 @@ final class FactStore implements BackgroundWork
     /** Stores a file's refreshed question list and re-registers its dependencies from the units they rely on. */
     private function replaceQuestions(string $path, array $questions): void
     {
-        if (! isset($this->fileFacts[$path])) {
+        $facts = $this->facts($path);
+        if ($facts === null) {
             return;
         }
-        $this->fileFacts[$path]['questions'] = $questions;
+        $facts['questions'] = $questions;
         $deps = [$path => true];
-        foreach ($this->fileFacts[$path]['deps'] as $dep) {
+        foreach ($facts['deps'] as $dep) {
             $deps[$dep] = true;
         }
         foreach ($questions as [, , $units]) {
@@ -534,9 +564,10 @@ final class FactStore implements BackgroundWork
                 $deps[str_contains($unit, '#') ? strstr($unit, '#', true) : $unit] = true;
             }
         }
-        $this->fileFacts[$path]['deps'] = array_keys($deps);
+        $facts['deps'] = array_keys($deps);
+        $this->keep($path, $facts);
         $this->forgetOwner("file:{$path}");
-        $this->remember("file:{$path}", $this->fileFacts[$path]['deps']);
+        $this->remember("file:{$path}", $facts['deps']);
     }
 
     /**
@@ -551,12 +582,12 @@ final class FactStore implements BackgroundWork
         $requests = [];
         foreach ($changedQuestions as $path => $questions) {
             $positions = [];
-            foreach ($this->fileFacts[$path]['questions'] as $position => [$question]) {
+            foreach ($this->questions($path) as $position => [$question]) {
                 if (isset($questions[$question])) {
                     $positions[$position] = true;
                 }
             }
-            foreach ($this->fileFacts[$path]['byName'] as $sites) {
+            foreach ($this->allSites($path) as $sites) {
                 foreach ($sites as $site) {
                     if (array_intersect_key($positions, array_flip($site[7])) !== []) {
                         $requests[$path][] = $site[6];
@@ -581,7 +612,7 @@ final class FactStore implements BackgroundWork
     /** @param array<int, array{0: array|null, 1: list<array>}> $refreshed token index => [site, its questions] */
     private function applyRefreshedSites(string $path, array $refreshed): void
     {
-        $facts = $this->fileFacts[$path];
+        $facts = $this->facts($path);
         $previousAnswerHash = $facts['answerHash'];
         $questions = $facts['questions'];
         $positionOf = [];
@@ -590,6 +621,7 @@ final class FactStore implements BackgroundWork
         }
         $changedNames = [];
         $this->indexConstructions($path, $facts['byName']['__construct'] ?? [], false);
+        $this->indexReceivers($path, $facts['byName'], false);
         foreach ($facts['byName'] as $name => $sites) {
             foreach ($sites as $offset => $site) {
                 if (! array_key_exists($site[6], $refreshed)) {
@@ -609,10 +641,11 @@ final class FactStore implements BackgroundWork
                 $facts['byName'][$name][$offset] = $newSite;
             }
         }
-        $this->fileFacts[$path] = $facts;
+        $this->keep($path, $facts);
         $this->indexConstructions($path, $facts['byName']['__construct'] ?? [], true);
+        $this->indexReceivers($path, $facts['byName'], true);
         $this->replaceQuestions($path, $questions);
-        $this->fileFacts[$path]['answerHash'] = self::answerHash($this->fileFacts[$path]);
+        $this->fileFacts[$path]['answerHash'] = self::answerHash($this->facts($path));
         if ($this->fileFacts[$path]['answerHash'] !== $previousAnswerHash) {
             $this->forgetCallersUsing('path', $path);
             foreach (array_keys($changedNames) as $name) {
@@ -623,14 +656,17 @@ final class FactStore implements BackgroundWork
 
     private function forgetFile(string $path): void
     {
-        $facts = $this->fileFacts[$path] ?? null;
+        $facts = $this->facts($path);
         if ($facts === null) {
             return;
         }
+        unset($this->unpackedScopes[$path]);
         foreach (array_keys($facts['byName']) as $name) {
             unset($this->pathsByName[$name][$path]);
         }
         $this->indexConstructions($path, $facts['byName']['__construct'] ?? [], false);
+        $this->indexReceivers($path, $facts['byName'], false);
+        $this->indexMethods($path, $facts['scopes'], false);
         foreach (array_keys($facts['classes']) as $class) {
             unset($this->declaredClasses[$class], $this->declaringFile[$class]);
             $this->descendants = null;
@@ -711,38 +747,124 @@ final class FactStore implements BackgroundWork
         }
     }
 
-    /** The one copy of a list of receiver types or question positions that every site holding it shares. */
-    private function sharedList(array $list): array
+    /** A file's facts whole, in the form storeFile() builds; null when the file is not read. */
+    private function facts(string $path): ?array
     {
-        return $this->sharedLists[implode("\0", $list)] ??= $list;
+        $kept = $this->fileFacts[$path] ?? null;
+        if ($kept === null) {
+            return null;
+        }
+        [$questions, $units] = Payload::decode($kept['packedRest'], false);
+
+        return array_diff_key($kept, ['packedSites' => true, 'packedScopes' => true, 'packedRest' => true])
+            + ['byName' => $this->allSites($path), 'questions' => $questions, 'scopes' => $this->scopes($path), 'units' => $units];
     }
 
-    /** @param bool $listsShared the sites already hold shared lists (rewriting them would copy every site) */
-    private function storeFile(string $path, array $fileFacts, bool $listsShared = false): void
+    /** @return list<array> a file's call sites of one called name */
+    private function sitesCalled(string $path, string $name): array
+    {
+        $packed = $this->fileFacts[$path]['packedSites'][$name] ?? null;
+
+        return $packed === null ? [] : $this->unpackSites($packed);
+    }
+
+    /** @return array<string, list<array>> a file's call sites by called name */
+    private function allSites(string $path): array
+    {
+        return array_map(fn (string $packed) => $this->unpackSites($packed), $this->fileFacts[$path]['packedSites'] ?? []);
+    }
+
+    /** @return list<array> */
+    private function scopes(string $path): array
+    {
+        if (isset($this->unpackedScopes[$path])) {
+            $scopes = $this->unpackedScopes[$path];
+            unset($this->unpackedScopes[$path]);
+
+            return $this->unpackedScopes[$path] = $scopes;
+        }
+        if (! isset($this->fileFacts[$path])) {
+            return [];
+        }
+        if (count($this->unpackedScopes) >= self::SCOPES_KEPT) {
+            unset($this->unpackedScopes[array_key_first($this->unpackedScopes)]);
+        }
+
+        return $this->unpackedScopes[$path] = Payload::decode($this->fileFacts[$path]['packedScopes'], false);
+    }
+
+    /** @return list<array> the questions a file's facts were built on */
+    private function questions(string $path): array
+    {
+        return isset($this->fileFacts[$path]) ? Payload::decode($this->fileFacts[$path]['packedRest'], false)[0] : [];
+    }
+
+    /** @return list<array> */
+    private function unpackSites(string $packed): array
+    {
+        $sites = Payload::decode($packed, false);
+        foreach ($sites as &$site) {
+            if (is_int($site[3])) {
+                $site[3] = $this->lists[$site[3]];
+            }
+            if (is_int($site[7] ?? null)) {
+                $site[7] = $this->lists[$site[7]];
+            }
+        }
+
+        return $sites;
+    }
+
+    /** Keeps a file's facts whole as facts() returns them, packing what only questions about the file read. */
+    private function keep(string $path, array $facts): void
+    {
+        $packedSites = [];
+        foreach ($facts['byName'] as $name => $sites) {
+            // Receiver types and question positions repeat across most sites (15,000 distinct type lists among
+            // 290,000 sites on a large backend): a packed site holds the index of the one kept copy of its list.
+            foreach ($sites as &$site) {
+                if ($site[3] !== null) {
+                    $site[3] = $this->listIndex[implode("\0", $site[3])] ??= array_push($this->lists, $site[3]) - 1;
+                }
+                if (isset($site[7])) {
+                    $site[7] = $this->listIndex[implode("\0", $site[7])] ??= array_push($this->lists, $site[7]) - 1;
+                }
+            }
+            unset($site);
+            $packedSites[$name] = Payload::encode($sites);
+        }
+        unset($this->unpackedScopes[$path]);
+        $this->fileFacts[$path] = array_diff_key($facts, self::PACKED_PARTS) + [
+            'packedSites' => $packedSites,
+            'packedScopes' => Payload::encode($facts['scopes']),
+            'packedRest' => Payload::encode([$facts['questions'] ?? [], $facts['units'] ?? []]),
+        ];
+    }
+
+    private function storeFile(string $path, array $fileFacts): void
     {
         unset($this->unreadable[$path]);
         $byName = [];
         foreach ($fileFacts['sites'] as $site) {
-            // Receiver types and question positions repeat across most sites (15,000 distinct type lists among
-            // 290,000 sites on a large backend): every site holds the one shared copy of its list.
-            if (! $listsShared && $site[3] !== null) {
-                $site[3] = $this->sharedList($site[3]);
-            }
-            if (! $listsShared && isset($site[7])) {
-                $site[7] = $this->sharedList($site[7]);
-            }
             $byName[$site[0]][] = $site;
         }
         unset($fileFacts['sites']);
         $fileFacts['byName'] = $byName;
         $fileFacts['mentions'] = array_flip($fileFacts['mentions']);
-        // Saved facts carry the hash they had: computing it again for every file is most of reading them back.
         $fileFacts['answerHash'] ??= self::answerHash($fileFacts);
-        $this->fileFacts[$path] = $fileFacts;
-        foreach (array_keys($byName) as $name) {
+        $this->keep($path, $fileFacts);
+        $this->index($path, $fileFacts);
+    }
+
+    /** Files a kept file's facts under the names, classes and dependencies questions look it up by. */
+    private function index(string $path, array $fileFacts): void
+    {
+        foreach (array_keys($fileFacts['byName']) as $name) {
             $this->pathsByName[$name][$path] = true;
         }
-        $this->indexConstructions($path, $byName['__construct'] ?? [], true);
+        $this->indexConstructions($path, $fileFacts['byName']['__construct'] ?? [], true);
+        $this->indexReceivers($path, $fileFacts['byName'], true);
+        $this->indexMethods($path, $fileFacts['scopes'], true);
         // Key by key: `$new + $all` would copy every class known so far for each file read.
         foreach ($fileFacts['classes'] as $class => $declared) {
             $this->declaredClasses[$class] = $declared;
@@ -767,6 +889,46 @@ final class FactStore implements BackgroundWork
                 }
             }
         }
+    }
+
+    /** @param array<string, list<array>> $byName a file's call sites by called name */
+    private function indexReceivers(string $path, array $byName, bool $add): void
+    {
+        foreach ($byName as $sites) {
+            foreach ($sites as $site) {
+                foreach ($site[2] === 'function' ? [] : ($site[3] ?? []) as $type) {
+                    $name = ltrim($type, '\\');
+                    $key = strtolower($name);
+                    if ($add) {
+                        $this->pathsByReceiverType[$key][$path] = true;
+                        $this->receiverTypeNames[$key] ??= $name;
+                    } else {
+                        unset($this->pathsByReceiverType[$key][$path]);
+                    }
+                }
+            }
+        }
+    }
+
+    private function indexMethods(string $path, array $scopes, bool $add): void
+    {
+        foreach ($scopes as $scope) {
+            $method = self::declaredMethodName($scope);
+            if ($method === null) {
+                continue;
+            }
+            if ($add) {
+                $this->pathsByMethodName[$method][$path] = true;
+            } else {
+                unset($this->pathsByMethodName[$method][$path]);
+            }
+        }
+    }
+
+    /** The lowercase name of the method a scope declares; null for a function, closure or test scope. */
+    private static function declaredMethodName(array $scope): ?string
+    {
+        return ! $scope[3] && str_contains($scope[0], '::') ? strtolower(substr(strrchr($scope[0], ':'), 1)) : null;
     }
 
     /** Fingerprint of everything a file's facts answer with (positions included, question bookkeeping excluded). */
@@ -996,21 +1158,17 @@ final class FactStore implements BackgroundWork
 
             return;
         }
-        // Indexes back to shared lists in place: the decoded sites are written once, never copied.
-        $lists = array_map(fn (array $list) => $this->sharedList($list), $saved['lists'] ?? []);
-        foreach ($saved['files'] as $path => &$facts) {
-            foreach ($facts['sites'] as &$site) {
-                if (is_int($site[3])) {
-                    $site[3] = $lists[$site[3]];
-                }
-                if (is_int($site[7] ?? null)) {
-                    $site[7] = $lists[$site[7]];
-                }
-            }
-            unset($site);
-            $this->storeFile($path, $facts, isset($saved['lists']));
+        // Saved as kept, packed parts and the lists their sites point into included: nothing is packed again. The
+        // store is still empty here (the warm-up starts before any question), so the saved list indexes hold.
+        $this->lists = $saved['lists'];
+        foreach ($this->lists as $index => $list) {
+            $this->listIndex[implode("\0", $list)] = $index;
         }
-        unset($facts);
+        foreach ($saved['files'] as $path => $kept) {
+            $this->fileFacts[$path] = $kept;
+            $this->index($path, ['byName' => $this->allSites($path), 'scopes' => $this->scopes($path)] + $kept);
+        }
+        $savedFiles = count($saved['files']);
         // Classes described before a restart, unless a file they were read from changed: describing them all again
         // is most of the CPU a start from saved facts would cost.
         $changedFiles = array_flip($changed);
@@ -1020,7 +1178,7 @@ final class FactStore implements BackgroundWork
                 $this->storeClass($key, $classFacts);
             }
         }
-        profilePhase($seeded ? 'start: facts of another checkout read' : 'start: saved facts read', $started, ['files' => count($saved['files']), 'changed' => count($changed)]);
+        profilePhase($seeded ? 'start: facts of another checkout read' : 'start: saved facts read', $started, ['files' => $savedFiles, 'changed' => count($changed)]);
         // What sync() changes is saved again once the server is idle; facts taken from another checkout are saved
         // as this one's own.
         $this->savedVersion = $seeded ? -1 : $this->factsVersion;
@@ -1037,7 +1195,7 @@ final class FactStore implements BackgroundWork
 
     /**
      * Writes every file's facts in a forked child, so a question arriving meanwhile is not kept waiting; the child
-     * converts them from its copy of the memory, which costs the driver nothing.
+     * writes them from its copy of the memory, which costs the driver nothing.
      */
     private function save(): void
     {
@@ -1049,29 +1207,8 @@ final class FactStore implements BackgroundWork
         $seedKey = $this->seedKey();
         $job = ForkedWorker::startBackground(function () use ($root, $stored, $classes, $path, $key, $seedKey) {
             $started = microtime(true);
-            $files = [];
             $outside = [];
-            // Shared lists are written once and named by their index, so reading the facts back makes no copies.
-            $lists = [];
-            $index = [];
-            $listed = function (array $list) use (&$lists, &$index): int {
-                return $index[implode("\0", $list)] ??= array_push($lists, $list) - 1;
-            };
-            foreach ($stored as $file => $facts) {
-                // Back to the form fileFacts() returns, which storeFile() reads.
-                $facts['sites'] = $facts['byName'] === [] ? [] : array_merge(...array_values($facts['byName']));
-                foreach ($facts['sites'] as &$site) {
-                    if ($site[3] !== null) {
-                        $site[3] = $listed($site[3]);
-                    }
-                    if (isset($site[7])) {
-                        $site[7] = $listed($site[7]);
-                    }
-                }
-                unset($site);
-                $facts['mentions'] = array_keys($facts['mentions']);
-                unset($facts['byName']);
-                $files[$file] = $facts;
+            foreach ($stored as $facts) {
                 foreach ($facts['deps'] as $dependency) {
                     if (! isset($stored[$dependency]) && str_ends_with($dependency, '.php')) {
                         $outside[$dependency] ??= FactExtraction::contentHash("{$root}/{$dependency}");
@@ -1091,10 +1228,12 @@ final class FactStore implements BackgroundWork
             // A full disk only costs the next server a slower start.
             // Without what storeClass() derives again cheaply.
             $classes = array_map(fn (array $facts) => array_diff_key($facts, ['ancestorKeys' => true]), $classes);
-            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode(['key' => $key, 'seedKey' => $seedKey, 'files' => $files, 'lists' => $lists, 'classes' => $classes, 'outside' => $outside]), 1)) !== false) {
+            // Files as kept, packed parts included, with the lists packed sites point into.
+            $saved = ['key' => $key, 'seedKey' => $seedKey, 'files' => $stored, 'lists' => $this->lists, 'classes' => $classes, 'outside' => $outside];
+            if (@file_put_contents("{$path}.tmp", gzencode(Payload::encode($saved), 1)) !== false) {
                 @rename("{$path}.tmp", $path);
             }
-            profilePhase('saved facts written', $started, ['files' => count($files), 'bytes' => @filesize($path)]);
+            profilePhase('saved facts written', $started, ['files' => count($stored), 'bytes' => @filesize($path)]);
 
             return true;
         }, 'save facts');
@@ -1230,13 +1369,9 @@ final class FactStore implements BackgroundWork
         foreach ($this->declaredClasses as [$name]) {
             $names[strtolower($name)] = $name;
         }
-        foreach ($this->fileFacts as $facts) {
-            foreach ($facts['byName'] as $sites) {
-                foreach ($sites as $site) {
-                    foreach ($site[2] === 'function' ? [] : ($site[3] ?? []) as $type) {
-                        $names[strtolower(ltrim($type, '\\'))] ??= ltrim($type, '\\');
-                    }
-                }
+        foreach ($this->pathsByReceiverType as $key => $paths) {
+            if ($paths !== []) {
+                $names[$key] ??= $this->receiverTypeNames[$key];
             }
         }
 
@@ -1480,7 +1615,7 @@ final class FactStore implements BackgroundWork
         $this->recordUse('name', self::DYNAMIC_NAME);
         foreach (array_keys($paths) as $path) {
             $this->recordUse('path', $path);
-            foreach ([...$this->fileFacts[$path]['byName'][$name] ?? [], ...($isConstructor ? [] : $this->fileFacts[$path]['byName'][self::DYNAMIC_NAME] ?? [])] as $site) {
+            foreach ([...$this->sitesCalled($path, $name), ...($isConstructor ? [] : $this->sitesCalled($path, self::DYNAMIC_NAME))] as $site) {
                 if ($site[2] !== 'function') {
                     $sites[] = [$path, $site];
                     array_push($receiverTypes, ...($site[3] ?? []));
@@ -1540,10 +1675,19 @@ final class FactStore implements BackgroundWork
             $this->ensureScanned(self::shortName($member), false);
         }
         $familyKeys = array_flip(array_map('strtolower', $family));
+        // A site's receiver type has class facts only under its own lowercase name, so only files with a call on a
+        // member of the family by name can hold one; the answer still depends on every file.
+        $candidates = [];
+        foreach (array_keys($familyKeys) as $key) {
+            $candidates += $this->pathsByReceiverType[$key] ?? [];
+        }
         $edges = [];
-        foreach ($this->fileFacts as $path => $facts) {
+        foreach (array_keys($this->fileFacts) as $path) {
             $this->recordUse('path', $path);
-            foreach ($facts['byName'] as $called => $sites) {
+            if (! isset($candidates[$path])) {
+                continue;
+            }
+            foreach ($this->allSites($path) as $called => $sites) {
                 foreach ($sites as $site) {
                     $isStatic = $site[2] === 'static' || $site[2] === 'late static';
                     if ($called === self::DYNAMIC_NAME || $site[3] === null || $isStatic !== $static || ! in_array($site[2], ['call', 'static', 'late static'], true)) {
@@ -1689,7 +1833,7 @@ final class FactStore implements BackgroundWork
 
     private function scopeRef(string $path, int $scopeIndex): array
     {
-        $scope = $this->fileFacts[$path]['scopes'][$scopeIndex] ?? null;
+        $scope = $this->scopes($path)[$scopeIndex] ?? null;
         $isTest = $this->files->isTestPath($path);
         if ($scope === null) {
             return ['symbol' => $path, 'file' => $path, 'line' => 1, 'kind' => $isTest ? 'test' : 'file'];
@@ -1715,7 +1859,7 @@ final class FactStore implements BackgroundWork
         $this->recordUse('name', $short);
         foreach (array_keys($this->pathsByName[$short] ?? []) as $path) {
             $this->recordUse('path', $path);
-            foreach ($this->fileFacts[$path]['byName'][$short] as $site) {
+            foreach ($this->sitesCalled($path, $short) as $site) {
                 if ($site[2] === 'function' && in_array($target, $site[3], true)) {
                     $edges[] = $this->edge($path, $site, $site[3][0] === $target ? 'exact' : 'likely');
                 }
@@ -1783,9 +1927,9 @@ final class FactStore implements BackgroundWork
         if (($symbols === [] || $caseOnlyClass) && $method === null && isIdentifierText($query)) {
             $this->ensureScanned($query, false);
             $wanted = strtolower($query);
-            foreach ($this->fileFacts as $path => $facts) {
-                foreach ($facts['scopes'] as $scope) {
-                    if (! $scope[3] && str_contains($scope[0], '::') && strtolower(substr(strrchr($scope[0], ':'), 1)) === $wanted) {
+            foreach (array_keys($this->pathsByMethodName[$wanted] ?? []) as $path) {
+                foreach ($this->scopes($path) as $scope) {
+                    if (self::declaredMethodName($scope) === $wanted) {
                         $symbols[] = ['symbol' => $scope[0], 'file' => $path, 'line' => $scope[1]];
                     }
                 }
@@ -1805,7 +1949,7 @@ final class FactStore implements BackgroundWork
             return $recordedLine;
         }
         $this->extractFiles([$path]);
-        foreach ($this->fileFacts[$path]['scopes'] ?? [] as $scope) {
+        foreach ($this->scopes($path) as $scope) {
             if (strcasecmp($scope[0], $symbol) === 0) {
                 return $scope[1];
             }
@@ -1817,7 +1961,7 @@ final class FactStore implements BackgroundWork
     public function locate(string $path, int $line): ?array
     {
         $this->extractFiles([$path]);
-        $facts = $this->fileFacts[$path] ?? null;
+        $facts = $this->facts($path);
         if ($facts === null) {
             return null;
         }
