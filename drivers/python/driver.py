@@ -983,10 +983,15 @@ class Store:
                     pending.append(child)
         return result
 
-    def callers(self, symbol):
+    def callers_json(self, symbol):
+        """The callers answer as the JSON text sent to the core: kept as text, a fraction of the memory of the
+        edges, and sent again as is."""
         if symbol not in self.answers:
-            self.answers[symbol] = self.compute_callers(symbol)
+            self.answers[symbol] = json.dumps(self.compute_callers(symbol))
         return self.answers[symbol]
+
+    def callers(self, symbol):
+        return json.loads(self.callers_json(symbol))
 
     def compute_callers(self, symbol):
         target = self.parse(symbol)
@@ -1160,6 +1165,10 @@ class Store:
         return self.ref(path, best[0], best[1]) if best else self.ref(path, "(module)", 1)
 
 
+class RawJson(str):
+    """A result already written as JSON: sent as it is."""
+
+
 def main():
     store = Store()
     store.start_warm_up()
@@ -1168,7 +1177,7 @@ def main():
         "sync": lambda request: store.sync(request.get("changed", [])),
         "resolve": lambda request: store.resolve(request.get("query", "")),
         "locate": lambda request: store.locate(request.get("file", ""), request.get("line", 1)),
-        "callers": lambda request: store.callers(request.get("symbol", "")),
+        "callers": lambda request: RawJson(store.callers_json(request.get("symbol", ""))),
     }
     for line in sys.stdin:
         try:
@@ -1177,10 +1186,11 @@ def main():
             continue
         try:
             handler = handlers.get(request.get("op"))
-            response = {"id": request.get("id"), "result": handler(request) if handler else None}
+            result = handler(request) if handler else None
+            line = f'{{"id": {json.dumps(request.get("id"))}, "result": {result}}}' if isinstance(result, RawJson) else json.dumps({"id": request.get("id"), "result": result})
         except Exception as error:  # an answer with the reason beats a silent driver
-            response = {"id": request.get("id"), "error": f"{type(error).__name__}: {error}"}
-        sys.stdout.write(json.dumps(response) + "\n")
+            line = json.dumps({"id": request.get("id"), "error": f"{type(error).__name__}: {error}"})
+        sys.stdout.write(line + "\n")
         sys.stdout.flush()
     store.save()  # the server is leaving: what changed since is saved for the next one
 
